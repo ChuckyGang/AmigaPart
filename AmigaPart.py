@@ -1245,8 +1245,9 @@ class EditPartitionDialog(tk.Toplevel):
         bufmemtype = next((v for lbl, v in BUFMEMTYPE_OPTS if lbl == sel),
                           int(sel.split("(")[1].rstrip(")")))
         sel_sb = self._sizeblock_var.get()
-        size_block = next((v for lbl, v in SIZEBLOCK_OPTS if lbl == sel_sb),
-                          int(sel_sb.split("(")[1].rstrip(")")))
+        size_block = next((v for lbl, v in SIZEBLOCK_OPTS if lbl == sel_sb), None)
+        if size_block is None:
+            size_block = int(sel_sb.split("(")[1].rstrip(")"))
 
         if lo < self._min_lo or hi > self._max_hi or lo > hi:
             messagebox.showerror("Error",
