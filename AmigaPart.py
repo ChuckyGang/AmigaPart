@@ -33,6 +33,15 @@ FS_MENU = [
 ]
 COLORS = ["#4A90D9","#E67E22","#27AE60","#8E44AD","#E74C3C","#16A085","#F39C12","#2980B9"]
 
+# BufMemType options: (display label, numeric value)
+# Values are Exec AllocMem() flags used when allocating filesystem buffers.
+BUFMEMTYPE_OPTS = [
+    ("Any (0)",       0),
+    ("Public (1)",    1),
+    ("Chip RAM (2)",  2),
+    ("Fast RAM (4)",  4),
+]
+
 
 # ─── Data classes ──────────────────────────────────────────────────────────────
 
@@ -797,14 +806,18 @@ class AddPartitionDialog(tk.Toplevel):
 
         flag_frame = tk.Frame(f, relief="groove", bd=2)
         flag_frame.grid(row=row, columnspan=2, sticky="ew", pady=(4, 2)); row += 1
-        self._bootable_var  = tk.BooleanVar(value=True)
-        self._automount_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(flag_frame, text=" Bootable ",
-                       variable=self._bootable_var,
-                       font=("", 12, "bold"), padx=8, pady=5).pack(side="left")
-        tk.Checkbutton(flag_frame, text=" Auto-mount ",
-                       variable=self._automount_var,
-                       font=("", 12, "bold"), padx=8, pady=5).pack(side="left")
+        self._bootable_var   = tk.BooleanVar(value=len(rdb.partitions) == 0)
+        self._automount_var  = tk.BooleanVar(value=True)
+        self._directscsi_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(flag_frame, text=" Bootable ",
+                        variable=self._bootable_var,
+                        style='Big.TCheckbutton').pack(side="left", padx=8, pady=5)
+        ttk.Checkbutton(flag_frame, text=" Auto-mount ",
+                        variable=self._automount_var,
+                        style='Big.TCheckbutton').pack(side="left", padx=8, pady=5)
+        ttk.Checkbutton(flag_frame, text=" Direct SCSI transfer ",
+                        variable=self._directscsi_var,
+                        style='Big.TCheckbutton').pack(side="left", padx=8, pady=5)
 
         self._size_lbl = tk.Label(f, text="", fg="#336699")
         self._size_lbl.grid(row=row, columnspan=2, sticky="w"); row+=1
@@ -842,10 +855,17 @@ class AddPartitionDialog(tk.Toplevel):
         prm.grid(row=row, columnspan=2, sticky="ew", pady=(2, 4)); row += 1
         fill_frame(prm, [
             ("NumBuffer:",   "30",          "numbuffer",   8),
-            ("BufMemType:",  "1",           "bufmemtype",  8),
             ("MaxTransfer:", "0x7FFFFFFF",  "maxtransfer", 12),
             ("Mask:",        "0xFFFFFFFE",  "mask",        12),
         ])
+        # BufMemType as dropdown (row 1, col 3 — alongside Mask)
+        tk.Label(prm, text="BufMemType:", justify="right").grid(
+            row=1, column=3, sticky="e", padx=(8, 2), pady=2)
+        self._bufmemtype_var = tk.StringVar(value=BUFMEMTYPE_OPTS[1][0])  # default: Public
+        ttk.Combobox(prm, textvariable=self._bufmemtype_var,
+                     values=[lbl for lbl, _ in BUFMEMTYPE_OPTS],
+                     state="readonly", width=14).grid(
+            row=1, column=4, sticky="w", padx=(0, 12), pady=2)
 
         bf = tk.Frame(f)
         bf.grid(row=row, columnspan=2, pady=(8,0))
@@ -877,12 +897,12 @@ class AddPartitionDialog(tk.Toplevel):
             prealloc    = _parse_intval(self._vars["prealloc"].get())
             interleave  = _parse_intval(self._vars["interleave"].get())
             numbuffer   = _parse_intval(self._vars["numbuffer"].get())
-            bufmemtype  = _parse_intval(self._vars["bufmemtype"].get())
             maxtransfer = _parse_intval(self._vars["maxtransfer"].get())
             mask        = _parse_intval(self._vars["mask"].get())
             bootblocks  = _parse_intval(self._vars["bootblocks"].get())
         except ValueError:
             messagebox.showerror("Error", "Numeric fields must be integers.", parent=self); return
+        bufmemtype = next(v for lbl, v in BUFMEMTYPE_OPTS if lbl == self._bufmemtype_var.get())
         if lo < self._rdb.locyl or hi > self._rdb.hicyl or lo > hi:
             messagebox.showerror("Error",
                 f"Cylinder range must be within {self._rdb.locyl}–{self._rdb.hicyl}.", parent=self)
@@ -901,8 +921,9 @@ class AddPartitionDialog(tk.Toplevel):
         p.high_cyl     = hi
         p.dos_type     = dos_type
         p.boot_pri     = bp
-        p.flags        = (0 if self._bootable_var.get()  else 2) | \
-                         (0 if self._automount_var.get() else 4)
+        p.flags        = (0 if self._bootable_var.get()   else 2) | \
+                         (0 if self._automount_var.get()  else 4) | \
+                         (8 if self._directscsi_var.get() else 0)
         p.surfaces     = surfaces
         p.blk_per_trk  = blkpertrk
         p.secs_per_blk = secsperblk
@@ -995,14 +1016,18 @@ class EditPartitionDialog(tk.Toplevel):
 
         flag_frame = tk.Frame(f, relief="groove", bd=2)
         flag_frame.grid(row=row, columnspan=2, sticky="ew", pady=(4, 2)); row += 1
-        self._bootable_var  = tk.BooleanVar(value=not (p.flags & 2))
-        self._automount_var = tk.BooleanVar(value=not (p.flags & 4))
-        tk.Checkbutton(flag_frame, text=" Bootable ",
-                       variable=self._bootable_var,
-                       font=("", 12, "bold"), padx=8, pady=5).pack(side="left")
-        tk.Checkbutton(flag_frame, text=" Auto-mount ",
-                       variable=self._automount_var,
-                       font=("", 12, "bold"), padx=8, pady=5).pack(side="left")
+        self._bootable_var   = tk.BooleanVar(value=not (p.flags & 2))
+        self._automount_var  = tk.BooleanVar(value=not (p.flags & 4))
+        self._directscsi_var = tk.BooleanVar(value=bool(p.flags & 8))
+        ttk.Checkbutton(flag_frame, text=" Bootable ",
+                        variable=self._bootable_var,
+                        style='Big.TCheckbutton').pack(side="left", padx=8, pady=5)
+        ttk.Checkbutton(flag_frame, text=" Auto-mount ",
+                        variable=self._automount_var,
+                        style='Big.TCheckbutton').pack(side="left", padx=8, pady=5)
+        ttk.Checkbutton(flag_frame, text=" Direct SCSI transfer ",
+                        variable=self._directscsi_var,
+                        style='Big.TCheckbutton').pack(side="left", padx=8, pady=5)
 
         self._size_lbl = tk.Label(f, text="", fg="#336699")
         self._size_lbl.grid(row=row, columnspan=2, sticky="w"); row += 1
@@ -1040,10 +1065,22 @@ class EditPartitionDialog(tk.Toplevel):
         prm.grid(row=row, columnspan=2, sticky="ew", pady=(2, 4)); row += 1
         fill_frame(prm, [
             ("NumBuffer:",   str(p.num_buffer),          "numbuffer",   8),
-            ("BufMemType:",  str(p.buf_mem_type),         "bufmemtype",  8),
             ("MaxTransfer:", f"0x{p.max_transfer:08X}",  "maxtransfer", 12),
             ("Mask:",        f"0x{p.mask:08X}",          "mask",        12),
         ])
+        # BufMemType as dropdown (row 1, col 3 — alongside Mask)
+        tk.Label(prm, text="BufMemType:", justify="right").grid(
+            row=1, column=3, sticky="e", padx=(8, 2), pady=2)
+        _bmt_default = next((lbl for lbl, v in BUFMEMTYPE_OPTS if v == p.buf_mem_type),
+                            f"Custom ({p.buf_mem_type})")
+        self._bufmemtype_var = tk.StringVar(value=_bmt_default)
+        _bmt_values = [lbl for lbl, _ in BUFMEMTYPE_OPTS]
+        if _bmt_default not in _bmt_values:
+            _bmt_values = [_bmt_default] + _bmt_values
+        ttk.Combobox(prm, textvariable=self._bufmemtype_var,
+                     values=_bmt_values,
+                     state="readonly", width=14).grid(
+            row=1, column=4, sticky="w", padx=(0, 12), pady=2)
 
         bf = tk.Frame(f)
         bf.grid(row=row, columnspan=2, pady=(8, 0))
@@ -1075,12 +1112,14 @@ class EditPartitionDialog(tk.Toplevel):
             prealloc    = _parse_intval(self._vars["prealloc"].get())
             interleave  = _parse_intval(self._vars["interleave"].get())
             numbuffer   = _parse_intval(self._vars["numbuffer"].get())
-            bufmemtype  = _parse_intval(self._vars["bufmemtype"].get())
             maxtransfer = _parse_intval(self._vars["maxtransfer"].get())
             mask        = _parse_intval(self._vars["mask"].get())
             bootblocks  = _parse_intval(self._vars["bootblocks"].get())
         except ValueError:
             messagebox.showerror("Error", "Numeric fields must be integers.", parent=self); return
+        sel = self._bufmemtype_var.get()
+        bufmemtype = next((v for lbl, v in BUFMEMTYPE_OPTS if lbl == sel),
+                          int(sel.split("(")[1].rstrip(")")))
 
         if lo < self._min_lo or hi > self._max_hi or lo > hi:
             messagebox.showerror("Error",
@@ -1104,8 +1143,9 @@ class EditPartitionDialog(tk.Toplevel):
         p.high_cyl     = hi
         p.dos_type     = next(v for n, v in _rdb_fs_menu(self._rdb) if n == self._fs_var.get())
         p.boot_pri     = bp
-        p.flags        = (0 if self._bootable_var.get()  else 2) | \
-                         (0 if self._automount_var.get() else 4)
+        p.flags        = (0 if self._bootable_var.get()   else 2) | \
+                         (0 if self._automount_var.get()  else 4) | \
+                         (8 if self._directscsi_var.get() else 0)
         p.surfaces     = surfaces
         p.blk_per_trk  = blkpertrk
         p.secs_per_blk = secsperblk
@@ -1408,6 +1448,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Amiga RDB Disk Partitioner")
+        style = ttk.Style()
+        style.configure('Big.TCheckbutton', indicatorsize=28)
         self.geometry("1100x700")
         self.minsize(900, 540)
         self._disks       = []
@@ -1689,7 +1731,11 @@ class App(tk.Tk):
             self._on_part_sel()
             return
         for i, p in enumerate(self._rdb.partitions):
-            flags = "Boot" if p.flags == 0 else f"0x{p.flags:02X}"
+            flag_parts = []
+            if not (p.flags & 2): flag_parts.append("Boot")
+            if not (p.flags & 4): flag_parts.append("AM")
+            if p.flags & 8:       flag_parts.append("SCSI")
+            flags = ",".join(flag_parts) if flag_parts else f"0x{p.flags:02X}"
             self._ptree.insert("", "end", iid=str(i),
                                values=(p.drive_name, p.low_cyl, p.high_cyl,
                                        p.fs_name, fmt_size(p.size_bytes),
