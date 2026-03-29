@@ -1034,7 +1034,9 @@ class EditPartitionDialog(tk.Toplevel):
 
         # ── Resize slider ──────────────────────────────────────────────────────
         self._slider_busy = False
+        self._snap_active = False
         orig_cyls = p.high_cyl - p.low_cyl + 1
+        self._prev_slider_cyls = orig_cyls
         max_cyls  = max(1, self._max_hi - p.low_cyl + 1)
         rsz = ttk.LabelFrame(f, text="Resize")
         rsz.grid(row=row, columnspan=2, sticky="ew", pady=(4, 2)); row += 1
@@ -1121,9 +1123,25 @@ class EditPartitionDialog(tk.Toplevel):
     def _on_slider(self, val):
         if self._slider_busy:
             return
+        cyls = int(float(val))
+        orig_cyls = self._orig.high_cyl - self._orig.low_cyl + 1
+        # Snap/sticky detent when crossing the original size position
+        if self._snap_active:
+            self._slider_busy = True
+            try:
+                self._slider_var.set(orig_cyls)
+            finally:
+                self._slider_busy = False
+            return
+        prev = self._prev_slider_cyls
+        if (prev < orig_cyls < cyls) or (prev > orig_cyls > cyls):
+            self._snap_active = True
+            cyls = orig_cyls
+            self.after(350, self._release_snap)
+        self._prev_slider_cyls = cyls
         self._slider_busy = True
         try:
-            cyls = int(float(val))
+            self._slider_var.set(cyls)
             try:
                 lo = int(self._vars["lo"].get())
             except ValueError:
@@ -1133,6 +1151,9 @@ class EditPartitionDialog(tk.Toplevel):
         finally:
             self._slider_busy = False
 
+    def _release_snap(self):
+        self._snap_active = False
+
     def _upd_resize_lbl(self, cyls):
         orig_cyls = self._orig.high_cyl - self._orig.low_cyl + 1
         sz = fmt_size(cyls * self._rdb.heads * self._rdb.sectors * 512)
@@ -1141,7 +1162,9 @@ class EditPartitionDialog(tk.Toplevel):
                 text=f"WARNING: Shrinking to {sz} ({cyls} cyl) — data WILL be lost!",
                 fg="red")
         elif cyls > orig_cyls:
-            self._resize_lbl.config(text=f"Expanding to {sz} ({cyls} cyl)", fg="#336699")
+            self._resize_lbl.config(
+                text=f"WARNING: Expanding to {sz} ({cyls} cyl) — data in new area may be lost!",
+                fg="#CC6600")
         else:
             self._resize_lbl.config(text=f"Current size: {sz} ({cyls} cyl)", fg="gray")
 
