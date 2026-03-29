@@ -630,9 +630,16 @@ class AddPartitionDialog(tk.Toplevel):
 
         lbl_entry("Boot priority:", "0", "bootpri", 6)
 
-        self._bootable_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(f, text="Bootable", variable=self._bootable_var).grid(
-            row=row, columnspan=2, sticky="w"); row+=1
+        flag_frame = tk.Frame(f, relief="groove", bd=2)
+        flag_frame.grid(row=row, columnspan=2, sticky="ew", pady=(4, 2)); row += 1
+        self._bootable_var  = tk.BooleanVar(value=True)
+        self._automount_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(flag_frame, text=" Bootable ",
+                       variable=self._bootable_var,
+                       font=("", 12, "bold"), padx=8, pady=5).pack(side="left")
+        tk.Checkbutton(flag_frame, text=" Auto-mount ",
+                       variable=self._automount_var,
+                       font=("", 12, "bold"), padx=8, pady=5).pack(side="left")
 
         self._size_lbl = tk.Label(f, text="", fg="#336699")
         self._size_lbl.grid(row=row, columnspan=2, sticky="w"); row+=1
@@ -729,7 +736,8 @@ class AddPartitionDialog(tk.Toplevel):
         p.high_cyl     = hi
         p.dos_type     = dos_type
         p.boot_pri     = bp
-        p.flags        = 0 if self._bootable_var.get() else 2
+        p.flags        = (0 if self._bootable_var.get()  else 2) | \
+                         (0 if self._automount_var.get() else 4)
         p.surfaces     = surfaces
         p.blk_per_trk  = blkpertrk
         p.secs_per_blk = secsperblk
@@ -820,10 +828,16 @@ class EditPartitionDialog(tk.Toplevel):
 
         lbl_entry("Boot priority:", str(p.boot_pri), "bootpri", 6)
 
-        self._bootable_var = tk.BooleanVar(value=(p.flags == 0))
-        tk.Checkbutton(f, text="Bootable",
-                       variable=self._bootable_var).grid(row=row, columnspan=2, sticky="w")
-        row += 1
+        flag_frame = tk.Frame(f, relief="groove", bd=2)
+        flag_frame.grid(row=row, columnspan=2, sticky="ew", pady=(4, 2)); row += 1
+        self._bootable_var  = tk.BooleanVar(value=not (p.flags & 2))
+        self._automount_var = tk.BooleanVar(value=not (p.flags & 4))
+        tk.Checkbutton(flag_frame, text=" Bootable ",
+                       variable=self._bootable_var,
+                       font=("", 12, "bold"), padx=8, pady=5).pack(side="left")
+        tk.Checkbutton(flag_frame, text=" Auto-mount ",
+                       variable=self._automount_var,
+                       font=("", 12, "bold"), padx=8, pady=5).pack(side="left")
 
         self._size_lbl = tk.Label(f, text="", fg="#336699")
         self._size_lbl.grid(row=row, columnspan=2, sticky="w"); row += 1
@@ -925,7 +939,8 @@ class EditPartitionDialog(tk.Toplevel):
         p.high_cyl     = hi
         p.dos_type     = next(v for n, v in _rdb_fs_menu(self._rdb) if n == self._fs_var.get())
         p.boot_pri     = bp
-        p.flags        = 0 if self._bootable_var.get() else 2
+        p.flags        = (0 if self._bootable_var.get()  else 2) | \
+                         (0 if self._automount_var.get() else 4)
         p.surfaces     = surfaces
         p.blk_per_trk  = blkpertrk
         p.secs_per_blk = secsperblk
