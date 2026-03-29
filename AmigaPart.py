@@ -487,6 +487,134 @@ def fmt_size(b: int) -> str:
 
 # ─── Dialogs ───────────────────────────────────────────────────────────────────
 
+class CreateImageDialog(tk.Toplevel):
+    """Ask for a file path and size, then create a zero-filled disk image."""
+
+    _UNITS = [("KB", 1024), ("MB", 1024**2), ("GB", 1024**3)]
+    _PRESETS = [
+        ("Custom", 0),
+        ("10 MB",  10 * 1024**2),
+        ("20 MB",  20 * 1024**2),
+        ("50 MB",  50 * 1024**2),
+        ("100 MB", 100 * 1024**2),
+        ("128 MB", 128 * 1024**2),
+        ("256 MB", 256 * 1024**2),
+        ("504 MB", 504 * 1024**2),
+        ("1 GB",   1024**3),
+        ("2 GB",   2 * 1024**3),
+        ("4 GB",   4 * 1024**3),
+    ]
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Create Blank Disk Image")
+        self.resizable(False, False)
+        self.grab_set()
+        self.result = None   # set to path on success
+        self._build()
+        self.transient(parent)
+        self.wait_window()
+
+    def _build(self):
+        f = tk.Frame(self, padx=14, pady=12)
+        f.pack(fill="both", expand=True)
+        row = 0
+
+        # ── File path ──────────────────────────────────────────────────────
+        tk.Label(f, text="Image file:").grid(row=row, column=0, sticky="e", pady=4)
+        self._path_var = tk.StringVar()
+        path_entry = tk.Entry(f, textvariable=self._path_var, width=36)
+        path_entry.grid(row=row, column=1, sticky="w", pady=4)
+        tk.Button(f, text="Browse…", command=self._browse).grid(
+            row=row, column=2, padx=(4, 0), pady=4)
+        row += 1
+
+        # ── Preset sizes ───────────────────────────────────────────────────
+        tk.Label(f, text="Preset size:").grid(row=row, column=0, sticky="e", pady=4)
+        self._preset_var = tk.StringVar(value=self._PRESETS[0][0])
+        ttk.Combobox(f, textvariable=self._preset_var,
+                     values=[p[0] for p in self._PRESETS],
+                     state="readonly", width=12).grid(row=row, column=1, sticky="w", pady=4)
+        self._preset_var.trace_add("write", self._on_preset)
+        row += 1
+
+        # ── Manual size entry ──────────────────────────────────────────────
+        tk.Label(f, text="Size:").grid(row=row, column=0, sticky="e", pady=4)
+        size_frame = tk.Frame(f)
+        size_frame.grid(row=row, column=1, columnspan=2, sticky="w", pady=4)
+        self._size_var = tk.StringVar(value="100")
+        self._size_var.trace_add("write", self._upd_preview)
+        tk.Entry(size_frame, textvariable=self._size_var, width=10).pack(side="left")
+        self._unit_var = tk.StringVar(value="MB")
+        ttk.Combobox(size_frame, textvariable=self._unit_var,
+                     values=[u[0] for u in self._UNITS],
+                     state="readonly", width=5).pack(side="left", padx=(4, 0))
+        self._unit_var.trace_add("write", self._upd_preview)
+        row += 1
+
+        # ── Size preview ───────────────────────────────────────────────────
+        self._preview_var = tk.StringVar()
+        tk.Label(f, textvariable=self._preview_var,
+                 fg="gray", font=("", 8)).grid(
+            row=row, column=1, columnspan=2, sticky="w"); row += 1
+        self._upd_preview()
+
+        # ── Buttons ────────────────────────────────────────────────────────
+        bf = tk.Frame(f)
+        bf.grid(row=row, columnspan=3, pady=(10, 0))
+        tk.Button(bf, text="Create",  width=12, command=self._ok).pack(side="left", padx=4)
+        tk.Button(bf, text="Cancel",  width=10, command=self.destroy).pack(side="left", padx=4)
+
+    def _browse(self):
+        path = filedialog.asksaveasfilename(
+            title="New Disk Image",
+            defaultextension=".img",
+            filetypes=[("Disk image", "*.img *.hdf"),
+                       ("All files", "*.*")])
+        if path:
+            self._path_var.set(path)
+
+    def _on_preset(self, *_):
+        label = self._preset_var.get()
+        if label == "Custom":
+            return
+        size = next(b for n, b in self._PRESETS if n == label)
+        # express in the largest clean unit
+        for unit_name, unit_mult in reversed(self._UNITS):
+            if size % unit_mult == 0:
+                self._unit_var.set(unit_name)
+                self._size_var.set(str(size // unit_mult))
+                return
+
+    def _upd_preview(self, *_):
+        try:
+            mult = next(m for n, m in self._UNITS if n == self._unit_var.get())
+            total = int(self._size_var.get()) * mult
+            self._preview_var.set(f"= {fmt_size(total)}  ({total:,} bytes)")
+        except (ValueError, StopIteration):
+            self._preview_var.set("")
+
+    def _ok(self):
+        path = self._path_var.get().strip()
+        if not path:
+            messagebox.showerror("Error", "Choose a file path first.", parent=self)
+            return
+        try:
+            mult = next(m for n, m in self._UNITS if n == self._unit_var.get())
+            total = int(self._size_var.get()) * mult
+        except (ValueError, StopIteration):
+            messagebox.showerror("Error", "Enter a valid numeric size.", parent=self)
+            return
+        if total <= 0:
+            messagebox.showerror("Error", "Size must be greater than zero.", parent=self)
+            return
+        if total % 512 != 0:
+            # Round up to nearest 512-byte sector boundary
+            total = ((total + 511) // 512) * 512
+        self.result = (path, total)
+        self.destroy()
+
+
 class InitRDBDialog(tk.Toplevel):
     def __init__(self, parent, disk: dict):
         super().__init__(parent)
@@ -1241,7 +1369,8 @@ class App(tk.Tk):
         fm = tk.Menu(mb, tearoff=0)
         fm.add_command(label="Refresh Disks", command=self._refresh_disks, accelerator="F5")
         fm.add_separator()
-        fm.add_command(label="Open Image as Disk…", command=self._do_open_image)
+        fm.add_command(label="Open Image as Disk…",  command=self._do_open_image)
+        fm.add_command(label="Create Blank Image…",  command=self._do_create_image)
         fm.add_separator()
         fm.add_command(label="Quit", command=self.quit)
         mb.add_cascade(label="File", menu=fm)
@@ -1945,6 +2074,42 @@ class App(tk.Tk):
             self._dtree.delete(path)
         self._dtree.insert("", "end", iid=path,
                            values=(name, fmt_size(size), path),
+                           tags=("imgfile",))
+        self._dtree.tag_configure("imgfile", foreground="#0055cc")
+        self._dtree.selection_set(path)
+        self._dtree.see(path)
+        self._on_disk_sel()
+
+    def _do_create_image(self):
+        dlg = CreateImageDialog(self)
+        if dlg.result is None:
+            return
+        path, total = dlg.result
+        # Write zeros in 1 MB chunks with a simple progress window
+        CHUNK = 1024 * 1024
+        written = 0
+        try:
+            with open(path, "wb") as fh:
+                while written < total:
+                    chunk = min(CHUNK, total - written)
+                    fh.write(b"\x00" * chunk)
+                    written += chunk
+        except OSError as e:
+            messagebox.showerror("Error", f"Could not create image:\n{e}")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return
+        # Add to device list exactly like _do_open_image
+        name = os.path.basename(path)
+        d = {"name": name, "path": path, "size": total, "model": path}
+        self._image_files = [x for x in self._image_files if x["path"] != path]
+        self._image_files.append(d)
+        if self._dtree.exists(path):
+            self._dtree.delete(path)
+        self._dtree.insert("", "end", iid=path,
+                           values=(name, fmt_size(total), path),
                            tags=("imgfile",))
         self._dtree.tag_configure("imgfile", foreground="#0055cc")
         self._dtree.selection_set(path)
