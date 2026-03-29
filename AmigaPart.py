@@ -2,7 +2,7 @@
 """AmigaDisk — Linux GUI tool for Amiga RDB (Rigid Disk Block) partitioning."""
 
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import subprocess, struct, os, math, json
 from typing import List, Optional
 
@@ -723,6 +723,10 @@ class App(tk.Tk):
         fm.add_separator()
         fm.add_command(label="Quit", command=self.quit)
         mb.add_cascade(label="File", menu=fm)
+        tm = tk.Menu(mb, tearoff=0)
+        tm.add_command(label="Backup RDB Blocks…", command=self._do_backup_rdb)
+        tm.add_command(label="Restore RDB Blocks…", command=self._do_restore_rdb)
+        mb.add_cascade(label="Tools", menu=tm)
         hm = tk.Menu(mb, tearoff=0)
         hm.add_command(label="About", command=self._about)
         mb.add_cascade(label="Help", menu=hm)
@@ -1281,6 +1285,81 @@ class App(tk.Tk):
                 text=f"RDB written to disk ({n_parts} partition(s))",
                 foreground="#007700")
             self._status.set(f"RDB successfully written to {dev}.")
+
+    def _do_backup_rdb(self):
+        if not self._cur_disk:
+            messagebox.showerror("No Disk Selected", "Select a disk first.")
+            return
+        dev = self._cur_disk["path"]
+        hi = self._rdb.rdbblock_hi if self._rdb else RDB_SCAN_LIMIT - 1
+        path = filedialog.asksaveasfilename(
+            title="Save RDB Backup",
+            defaultextension=".rdb",
+            filetypes=[("RDB backup", "*.rdb"), ("Binary", "*.bin"), ("All files", "*.*")])
+        if not path:
+            return
+        blocks = []
+        for blk in range(hi + 1):
+            data = _read_block(dev, blk)
+            if data is None:
+                messagebox.showerror("Read Error", f"Failed to read block {blk} from {dev}.")
+                return
+            blocks.append(data)
+        try:
+            with open(path, "wb") as f:
+                for b in blocks:
+                    f.write(b)
+        except OSError as e:
+            messagebox.showerror("Save Error", str(e))
+            return
+        messagebox.showinfo("Backup Complete",
+            f"Saved {hi + 1} block(s) (blocks 0–{hi}) to:\n{path}")
+        self._status.set(f"RDB backup saved: {os.path.basename(path)}")
+
+    def _do_restore_rdb(self):
+        if not self._cur_disk:
+            messagebox.showerror("No Disk Selected", "Select a disk first.")
+            return
+        dev = self._cur_disk["path"]
+        path = filedialog.askopenfilename(
+            title="Open RDB Backup",
+            filetypes=[("RDB backup", "*.rdb"), ("Binary", "*.bin"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError as e:
+            messagebox.showerror("Open Error", str(e))
+            return
+        if len(raw) < 512 or len(raw) % 512 != 0:
+            messagebox.showerror("Invalid File", "File size is not a multiple of 512 bytes.")
+            return
+        if struct.unpack_from(">I", raw, 0)[0] != RDSK_ID:
+            messagebox.showerror("Invalid File",
+                "First block is not an Amiga RDSK block.\n"
+                "This does not appear to be a valid RDB backup.")
+            return
+        n_blocks = len(raw) // 512
+        if not messagebox.askyesno("Confirm Restore",
+                f"⚠  WARNING  ⚠\n\n"
+                f"This will restore {n_blocks} block(s) to:\n\n"
+                f"  {dev}   ({fmt_size(self._cur_disk['size'])})\n\n"
+                f"This overwrites the existing RDB area on the disk.\n\n"
+                f"Continue?", icon="warning"):
+            return
+        if not os.access(dev, os.W_OK):
+            messagebox.showerror("Permission Denied",
+                f"Cannot write to {dev}.\n\nRun this program with sudo.")
+            return
+        for i in range(n_blocks):
+            if not _write_block(dev, i, raw[i*512:(i+1)*512]):
+                messagebox.showerror("Write Error", f"Failed to write block {i} to {dev}.")
+                return
+        messagebox.showinfo("Restore Complete",
+            f"Restored {n_blocks} block(s) to {dev}.\n\n"
+            f"Re-select the disk to reload the RDB.")
+        self._status.set(f"RDB restored from {os.path.basename(path)}. Re-select disk to refresh.")
 
     def _about(self):
         messagebox.showinfo("About AmigaDisk",
