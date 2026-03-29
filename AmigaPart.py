@@ -1163,8 +1163,8 @@ class EditPartitionDialog(tk.Toplevel):
                 fg="red")
         elif cyls > orig_cyls:
             self._resize_lbl.config(
-                text=f"WARNING: Expanding to {sz} ({cyls} cyl) — data in new area may be lost!",
-                fg="#CC6600")
+                text=f"WARNING: Expanding to {sz} ({cyls} cyl) — data WILL be lost! (filesystem does not support expansion)",
+                fg="red")
         else:
             self._resize_lbl.config(text=f"Current size: {sz} ({cyls} cyl)", fg="gray")
 
