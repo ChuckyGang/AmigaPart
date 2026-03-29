@@ -42,6 +42,17 @@ BUFMEMTYPE_OPTS = [
     ("Fast RAM (4)",  4),
 ]
 
+# SizeBlock: filesystem block size in longwords (bytes / 4)
+SIZEBLOCK_OPTS = [
+    ("512 B  (128 lw)",   128),
+    ("1 KB   (256 lw)",   256),
+    ("2 KB   (512 lw)",   512),
+    ("4 KB  (1024 lw)",  1024),
+    ("8 KB  (2048 lw)",  2048),
+    ("16 KB (4096 lw)",  4096),
+    ("32 KB (8192 lw)",  8192),
+]
+
 
 # ─── Data classes ──────────────────────────────────────────────────────────────
 
@@ -53,6 +64,7 @@ class PartitionInfo:
         self.drive_name   = "DH0"
         self.low_cyl      = 0
         self.high_cyl     = 0
+        self.size_block   = 128        # filesystem block size in longwords (128 = 512 B)
         self.surfaces     = 1          # heads
         self.blk_per_trk  = 1          # sectors per track
         self.secs_per_blk = 1          # sectors per filesystem block (usually 1)
@@ -259,6 +271,7 @@ def read_rdb(dev: str) -> Optional[RDBInfo]:
         # e+68: Baud
         # e+72: Control
         # e+76: BootBlocks
+        p.size_block   = struct.unpack_from(">I", data, e+ 4)[0]
         p.surfaces     = struct.unpack_from(">I", data, e+12)[0]
         p.secs_per_blk = struct.unpack_from(">I", data, e+16)[0]
         p.blk_per_trk  = struct.unpack_from(">I", data, e+20)[0]
@@ -389,7 +402,7 @@ def build_part_block(p: PartitionInfo, rdb_heads: int, rdb_sectors: int) -> byte
     # DosEnvec at offset 128
     e = 128
     struct.pack_into(">I", d, e+ 0, 20)            # TableSize (20 longs = through BootBlocks)
-    struct.pack_into(">I", d, e+ 4, 128)           # SizeBlock = 512/4
+    struct.pack_into(">I", d, e+ 4, p.size_block)  # SizeBlock
     struct.pack_into(">I", d, e+ 8, 0)             # SecOrg
     struct.pack_into(">I", d, e+12, surfs)         # Surfaces
     struct.pack_into(">I", d, e+16, 1)             # SectorsPerBlock
@@ -837,10 +850,17 @@ class AddPartitionDialog(tk.Toplevel):
                 tk.Entry(parent, textvariable=v, width=w).grid(
                     row=r, column=c+1, sticky="w", padx=(0, 12), pady=2)
 
+        # ── Advanced toggle ────────────────────────────────────────────────────
+        self._adv_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="Show advanced settings",
+                        variable=self._adv_var,
+                        command=self._toggle_adv).grid(
+            row=row, columnspan=2, sticky="w", pady=(6, 0)); row += 1
+
         # ── Advanced ──────────────────────────────────────────────────────────
-        adv = ttk.LabelFrame(f, text="Advanced")
-        adv.grid(row=row, columnspan=2, sticky="ew", pady=(8, 2)); row += 1
-        fill_frame(adv, [
+        self._adv_frame = ttk.LabelFrame(f, text="Advanced")
+        self._adv_frame.grid(row=row, columnspan=2, sticky="ew", pady=(4, 2)); row += 1
+        fill_frame(self._adv_frame, [
             ("Surfaces:",   str(self._rdb.heads),   "surfaces",   8),
             ("Secs/track:", str(self._rdb.sectors), "blkpertrk",  8),
             ("Secs/block:", "1",                    "secsperblk", 8),
@@ -849,28 +869,49 @@ class AddPartitionDialog(tk.Toplevel):
             ("Interleave:", "0",                    "interleave", 8),
             ("BootBlocks:", "2",                    "bootblocks", 8),
         ])
+        # SizeBlock dropdown alongside BootBlocks (row 3, col 3)
+        tk.Label(self._adv_frame, text="Block size:", justify="right").grid(
+            row=3, column=3, sticky="e", padx=(8, 2), pady=2)
+        self._sizeblock_var = tk.StringVar(value=SIZEBLOCK_OPTS[0][0])
+        ttk.Combobox(self._adv_frame, textvariable=self._sizeblock_var,
+                     values=[lbl for lbl, _ in SIZEBLOCK_OPTS],
+                     state="readonly", width=16).grid(
+            row=3, column=4, sticky="w", padx=(0, 12), pady=2)
 
         # ── Parameters ────────────────────────────────────────────────────────
-        prm = ttk.LabelFrame(f, text="Parameters")
-        prm.grid(row=row, columnspan=2, sticky="ew", pady=(2, 4)); row += 1
-        fill_frame(prm, [
+        self._prm_frame = ttk.LabelFrame(f, text="Parameters")
+        self._prm_frame.grid(row=row, columnspan=2, sticky="ew", pady=(2, 4)); row += 1
+        fill_frame(self._prm_frame, [
             ("NumBuffer:",   "30",          "numbuffer",   8),
             ("MaxTransfer:", "0x7FFFFFFF",  "maxtransfer", 12),
             ("Mask:",        "0xFFFFFFFE",  "mask",        12),
         ])
         # BufMemType as dropdown (row 1, col 3 — alongside Mask)
-        tk.Label(prm, text="BufMemType:", justify="right").grid(
+        tk.Label(self._prm_frame, text="BufMemType:", justify="right").grid(
             row=1, column=3, sticky="e", padx=(8, 2), pady=2)
         self._bufmemtype_var = tk.StringVar(value=BUFMEMTYPE_OPTS[1][0])  # default: Public
-        ttk.Combobox(prm, textvariable=self._bufmemtype_var,
+        ttk.Combobox(self._prm_frame, textvariable=self._bufmemtype_var,
                      values=[lbl for lbl, _ in BUFMEMTYPE_OPTS],
                      state="readonly", width=14).grid(
             row=1, column=4, sticky="w", padx=(0, 12), pady=2)
+
+        self._adv_frame.grid_remove()
+        self._prm_frame.grid_remove()
 
         bf = tk.Frame(f)
         bf.grid(row=row, columnspan=2, pady=(8,0))
         tk.Button(bf, text="Add",    width=10, command=self._ok).pack(side="left", padx=4)
         tk.Button(bf, text="Cancel", width=10, command=self.destroy).pack(side="left", padx=4)
+
+    def _toggle_adv(self):
+        if self._adv_var.get():
+            self._adv_frame.grid()
+            self._prm_frame.grid()
+        else:
+            self._adv_frame.grid_remove()
+            self._prm_frame.grid_remove()
+        self.update_idletasks()
+        self.geometry("")
 
     def _upd_size(self, *_):
         try:
@@ -903,6 +944,7 @@ class AddPartitionDialog(tk.Toplevel):
         except ValueError:
             messagebox.showerror("Error", "Numeric fields must be integers.", parent=self); return
         bufmemtype = next(v for lbl, v in BUFMEMTYPE_OPTS if lbl == self._bufmemtype_var.get())
+        size_block = next(v for lbl, v in SIZEBLOCK_OPTS if lbl == self._sizeblock_var.get())
         if lo < self._rdb.locyl or hi > self._rdb.hicyl or lo > hi:
             messagebox.showerror("Error",
                 f"Cylinder range must be within {self._rdb.locyl}–{self._rdb.hicyl}.", parent=self)
@@ -924,6 +966,7 @@ class AddPartitionDialog(tk.Toplevel):
         p.flags        = (0 if self._bootable_var.get()   else 2) | \
                          (0 if self._automount_var.get()  else 4) | \
                          (8 if self._directscsi_var.get() else 0)
+        p.size_block   = size_block
         p.surfaces     = surfaces
         p.blk_per_trk  = blkpertrk
         p.secs_per_blk = secsperblk
@@ -1060,10 +1103,17 @@ class EditPartitionDialog(tk.Toplevel):
                 tk.Entry(parent, textvariable=v, width=w).grid(
                     row=r, column=c+1, sticky="w", padx=(0, 12), pady=2)
 
+        # ── Advanced toggle ────────────────────────────────────────────────────
+        self._adv_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="Show advanced settings",
+                        variable=self._adv_var,
+                        command=self._toggle_adv).grid(
+            row=row, columnspan=2, sticky="w", pady=(6, 0)); row += 1
+
         # ── Advanced ──────────────────────────────────────────────────────────
-        adv = ttk.LabelFrame(f, text="Advanced")
-        adv.grid(row=row, columnspan=2, sticky="ew", pady=(8, 2)); row += 1
-        fill_frame(adv, [
+        self._adv_frame = ttk.LabelFrame(f, text="Advanced")
+        self._adv_frame.grid(row=row, columnspan=2, sticky="ew", pady=(4, 2)); row += 1
+        fill_frame(self._adv_frame, [
             ("Surfaces:",   str(p.surfaces),     "surfaces",   8),
             ("Secs/track:", str(p.blk_per_trk),  "blkpertrk",  8),
             ("Secs/block:", str(p.secs_per_blk), "secsperblk", 8),
@@ -1072,17 +1122,30 @@ class EditPartitionDialog(tk.Toplevel):
             ("Interleave:", str(p.interleave),   "interleave", 8),
             ("BootBlocks:", str(p.boot_blocks),  "bootblocks", 8),
         ])
+        # SizeBlock dropdown alongside BootBlocks (row 3, col 3)
+        tk.Label(self._adv_frame, text="Block size:", justify="right").grid(
+            row=3, column=3, sticky="e", padx=(8, 2), pady=2)
+        _sb_default = next((lbl for lbl, v in SIZEBLOCK_OPTS if v == p.size_block),
+                           f"Custom ({p.size_block})")
+        self._sizeblock_var = tk.StringVar(value=_sb_default)
+        _sb_values = [lbl for lbl, _ in SIZEBLOCK_OPTS]
+        if _sb_default not in _sb_values:
+            _sb_values = [_sb_default] + _sb_values
+        ttk.Combobox(self._adv_frame, textvariable=self._sizeblock_var,
+                     values=_sb_values,
+                     state="readonly", width=16).grid(
+            row=3, column=4, sticky="w", padx=(0, 12), pady=2)
 
         # ── Parameters ────────────────────────────────────────────────────────
-        prm = ttk.LabelFrame(f, text="Parameters")
-        prm.grid(row=row, columnspan=2, sticky="ew", pady=(2, 4)); row += 1
-        fill_frame(prm, [
+        self._prm_frame = ttk.LabelFrame(f, text="Parameters")
+        self._prm_frame.grid(row=row, columnspan=2, sticky="ew", pady=(2, 4)); row += 1
+        fill_frame(self._prm_frame, [
             ("NumBuffer:",   str(p.num_buffer),          "numbuffer",   8),
             ("MaxTransfer:", f"0x{p.max_transfer:08X}",  "maxtransfer", 12),
             ("Mask:",        f"0x{p.mask:08X}",          "mask",        12),
         ])
         # BufMemType as dropdown (row 1, col 3 — alongside Mask)
-        tk.Label(prm, text="BufMemType:", justify="right").grid(
+        tk.Label(self._prm_frame, text="BufMemType:", justify="right").grid(
             row=1, column=3, sticky="e", padx=(8, 2), pady=2)
         _bmt_default = next((lbl for lbl, v in BUFMEMTYPE_OPTS if v == p.buf_mem_type),
                             f"Custom ({p.buf_mem_type})")
@@ -1090,15 +1153,28 @@ class EditPartitionDialog(tk.Toplevel):
         _bmt_values = [lbl for lbl, _ in BUFMEMTYPE_OPTS]
         if _bmt_default not in _bmt_values:
             _bmt_values = [_bmt_default] + _bmt_values
-        ttk.Combobox(prm, textvariable=self._bufmemtype_var,
+        ttk.Combobox(self._prm_frame, textvariable=self._bufmemtype_var,
                      values=_bmt_values,
                      state="readonly", width=14).grid(
             row=1, column=4, sticky="w", padx=(0, 12), pady=2)
+
+        self._adv_frame.grid_remove()
+        self._prm_frame.grid_remove()
 
         bf = tk.Frame(f)
         bf.grid(row=row, columnspan=2, pady=(8, 0))
         tk.Button(bf, text="Save",   width=10, command=self._ok).pack(side="left", padx=4)
         tk.Button(bf, text="Cancel", width=10, command=self.destroy).pack(side="left", padx=4)
+
+    def _toggle_adv(self):
+        if self._adv_var.get():
+            self._adv_frame.grid()
+            self._prm_frame.grid()
+        else:
+            self._adv_frame.grid_remove()
+            self._prm_frame.grid_remove()
+        self.update_idletasks()
+        self.geometry("")
 
     def _upd_size(self, *_):
         try:
@@ -1175,6 +1251,9 @@ class EditPartitionDialog(tk.Toplevel):
         sel = self._bufmemtype_var.get()
         bufmemtype = next((v for lbl, v in BUFMEMTYPE_OPTS if lbl == sel),
                           int(sel.split("(")[1].rstrip(")")))
+        sel_sb = self._sizeblock_var.get()
+        size_block = next((v for lbl, v in SIZEBLOCK_OPTS if lbl == sel_sb),
+                          int(sel_sb.split("(")[1].rstrip(")")))
 
         if lo < self._min_lo or hi > self._max_hi or lo > hi:
             messagebox.showerror("Error",
@@ -1201,6 +1280,7 @@ class EditPartitionDialog(tk.Toplevel):
         p.flags        = (0 if self._bootable_var.get()   else 2) | \
                          (0 if self._automount_var.get()  else 4) | \
                          (8 if self._directscsi_var.get() else 0)
+        p.size_block   = size_block
         p.surfaces     = surfaces
         p.blk_per_trk  = blkpertrk
         p.secs_per_blk = secsperblk
