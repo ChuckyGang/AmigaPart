@@ -504,31 +504,39 @@ class AddPartitionDialog(tk.Toplevel):
             self._vars[key].trace_add("write", self._upd_size)
         self._upd_size()
 
+        def fill_frame(parent, fields):
+            for i, (lbl, val, key, w) in enumerate(fields):
+                c = (i % 2) * 3
+                r = i // 2
+                tk.Label(parent, text=lbl, justify="right").grid(
+                    row=r, column=c, sticky="e", padx=(8, 2), pady=2)
+                v = tk.StringVar(value=val)
+                self._vars[key] = v
+                tk.Entry(parent, textvariable=v, width=w).grid(
+                    row=r, column=c+1, sticky="w", padx=(0, 12), pady=2)
+
         # ── Advanced ──────────────────────────────────────────────────────────
         adv = ttk.LabelFrame(f, text="Advanced")
-        adv.grid(row=row, columnspan=2, sticky="ew", pady=(8, 4)); row += 1
-        adv_fields = [
-            ("Surfaces:",    str(self._rdb.heads),   "surfaces",    8),
-            ("Secs/track:",  str(self._rdb.sectors), "blkpertrk",   8),
-            ("Secs/block:",  "1",                    "secsperblk",  8),
-            ("Reserved:",    "2",                    "reserved",    8),
-            ("PreAlloc:",    "0",                    "prealloc",    8),
-            ("Interleave:",  "0",                    "interleave",  8),
-            ("NumBuffer:",   "30",                   "numbuffer",   8),
-            ("BufMemType:",  "1",                    "bufmemtype",  8),
-            ("MaxTransfer:", "0x7FFFFFFF",           "maxtransfer", 12),
-            ("Mask:",        "0xFFFFFFFE",           "mask",        12),
-            ("BootBlocks:",  "2",                    "bootblocks",  8),
-        ]
-        for i, (lbl, val, key, w) in enumerate(adv_fields):
-            c = (i % 2) * 3
-            r = i // 2
-            tk.Label(adv, text=lbl, justify="right").grid(
-                row=r, column=c, sticky="e", padx=(8, 2), pady=2)
-            v = tk.StringVar(value=val)
-            self._vars[key] = v
-            tk.Entry(adv, textvariable=v, width=w).grid(
-                row=r, column=c+1, sticky="w", padx=(0, 12), pady=2)
+        adv.grid(row=row, columnspan=2, sticky="ew", pady=(8, 2)); row += 1
+        fill_frame(adv, [
+            ("Surfaces:",   str(self._rdb.heads),   "surfaces",   8),
+            ("Secs/track:", str(self._rdb.sectors), "blkpertrk",  8),
+            ("Secs/block:", "1",                    "secsperblk", 8),
+            ("Reserved:",   "2",                    "reserved",   8),
+            ("PreAlloc:",   "0",                    "prealloc",   8),
+            ("Interleave:", "0",                    "interleave", 8),
+            ("BootBlocks:", "2",                    "bootblocks", 8),
+        ])
+
+        # ── Parameters ────────────────────────────────────────────────────────
+        prm = ttk.LabelFrame(f, text="Parameters")
+        prm.grid(row=row, columnspan=2, sticky="ew", pady=(2, 4)); row += 1
+        fill_frame(prm, [
+            ("NumBuffer:",   "30",          "numbuffer",   8),
+            ("BufMemType:",  "1",           "bufmemtype",  8),
+            ("MaxTransfer:", "0x7FFFFFFF",  "maxtransfer", 12),
+            ("Mask:",        "0xFFFFFFFE",  "mask",        12),
+        ])
 
         bf = tk.Frame(f)
         bf.grid(row=row, columnspan=2, pady=(8,0))
@@ -686,31 +694,39 @@ class EditPartitionDialog(tk.Toplevel):
             self._vars[key].trace_add("write", self._upd_size)
         self._upd_size()
 
+        def fill_frame(parent, fields):
+            for i, (lbl, val, key, w) in enumerate(fields):
+                c = (i % 2) * 3
+                r = i // 2
+                tk.Label(parent, text=lbl, justify="right").grid(
+                    row=r, column=c, sticky="e", padx=(8, 2), pady=2)
+                v = tk.StringVar(value=val)
+                self._vars[key] = v
+                tk.Entry(parent, textvariable=v, width=w).grid(
+                    row=r, column=c+1, sticky="w", padx=(0, 12), pady=2)
+
         # ── Advanced ──────────────────────────────────────────────────────────
         adv = ttk.LabelFrame(f, text="Advanced")
-        adv.grid(row=row, columnspan=2, sticky="ew", pady=(8, 4)); row += 1
-        adv_fields = [
-            ("Surfaces:",    str(p.surfaces),              "surfaces",    8),
-            ("Secs/track:",  str(p.blk_per_trk),           "blkpertrk",   8),
-            ("Secs/block:",  str(p.secs_per_blk),          "secsperblk",  8),
-            ("Reserved:",    str(p.reserved),              "reserved",    8),
-            ("PreAlloc:",    str(p.prealloc),              "prealloc",    8),
-            ("Interleave:",  str(p.interleave),            "interleave",  8),
-            ("NumBuffer:",   str(p.num_buffer),            "numbuffer",   8),
-            ("BufMemType:",  str(p.buf_mem_type),          "bufmemtype",  8),
-            ("MaxTransfer:", f"0x{p.max_transfer:08X}",   "maxtransfer", 12),
-            ("Mask:",        f"0x{p.mask:08X}",           "mask",        12),
-            ("BootBlocks:",  str(p.boot_blocks),           "bootblocks",  8),
-        ]
-        for i, (lbl, val, key, w) in enumerate(adv_fields):
-            c = (i % 2) * 3
-            r = i // 2
-            tk.Label(adv, text=lbl, justify="right").grid(
-                row=r, column=c, sticky="e", padx=(8, 2), pady=2)
-            v = tk.StringVar(value=val)
-            self._vars[key] = v
-            tk.Entry(adv, textvariable=v, width=w).grid(
-                row=r, column=c+1, sticky="w", padx=(0, 12), pady=2)
+        adv.grid(row=row, columnspan=2, sticky="ew", pady=(8, 2)); row += 1
+        fill_frame(adv, [
+            ("Surfaces:",   str(p.surfaces),     "surfaces",   8),
+            ("Secs/track:", str(p.blk_per_trk),  "blkpertrk",  8),
+            ("Secs/block:", str(p.secs_per_blk), "secsperblk", 8),
+            ("Reserved:",   str(p.reserved),     "reserved",   8),
+            ("PreAlloc:",   str(p.prealloc),     "prealloc",   8),
+            ("Interleave:", str(p.interleave),   "interleave", 8),
+            ("BootBlocks:", str(p.boot_blocks),  "bootblocks", 8),
+        ])
+
+        # ── Parameters ────────────────────────────────────────────────────────
+        prm = ttk.LabelFrame(f, text="Parameters")
+        prm.grid(row=row, columnspan=2, sticky="ew", pady=(2, 4)); row += 1
+        fill_frame(prm, [
+            ("NumBuffer:",   str(p.num_buffer),          "numbuffer",   8),
+            ("BufMemType:",  str(p.buf_mem_type),         "bufmemtype",  8),
+            ("MaxTransfer:", f"0x{p.max_transfer:08X}",  "maxtransfer", 12),
+            ("Mask:",        f"0x{p.mask:08X}",          "mask",        12),
+        ])
 
         bf = tk.Frame(f)
         bf.grid(row=row, columnspan=2, pady=(8, 0))
