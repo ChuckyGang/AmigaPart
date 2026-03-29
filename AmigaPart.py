@@ -3,7 +3,7 @@
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-import subprocess, struct, os, math, json
+import subprocess, struct, os, math, json, re, threading, queue
 from typing import List, Optional
 
 # ─── Constants ─────────────────────────────────────────────────────────────────
@@ -698,6 +698,103 @@ class EditPartitionDialog(tk.Toplevel):
         self.destroy()
 
 
+# ─── dd progress dialog ────────────────────────────────────────────────────────
+
+class _DDProgressDialog(tk.Toplevel):
+    """Modal progress dialog that runs a dd command and shows live progress."""
+
+    def __init__(self, parent, title: str, cmd: list, total_bytes: int):
+        super().__init__(parent)
+        self.title(title)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.transient(parent)
+        self._total     = total_bytes
+        self._proc      = None
+        self._done      = False
+        self._error     = None
+        self._cancelled = False
+        self._bytes     = 0
+        self._speed     = ""
+        self._build()
+        self.grab_set()
+        self._thread = threading.Thread(target=self._run, args=(cmd,), daemon=True)
+        self._thread.start()
+        self._poll()
+        self.wait_window()
+
+    @property
+    def success(self):
+        return self._done and not self._cancelled and self._error is None
+
+    def _build(self):
+        f = tk.Frame(self, padx=16, pady=12)
+        f.pack(fill="both", expand=True)
+        self._lbl = tk.Label(f, text="Starting…", width=52, anchor="w")
+        self._lbl.pack(fill="x", pady=(0, 6))
+        self._bar = ttk.Progressbar(f, length=420, mode="determinate", maximum=1000)
+        self._bar.pack(fill="x", pady=(0, 6))
+        self._speed_lbl = tk.Label(f, text="", fg="#336699", anchor="w")
+        self._speed_lbl.pack(fill="x", pady=(0, 8))
+        tk.Button(f, text="Cancel", width=10, command=self._cancel).pack()
+
+    def _run(self, cmd):
+        try:
+            self._proc = subprocess.Popen(cmd, stderr=subprocess.PIPE,
+                                          stdout=subprocess.DEVNULL)
+            buf = b""
+            while True:
+                ch = self._proc.stderr.read(1)
+                if not ch:
+                    break
+                if ch in (b'\r', b'\n'):
+                    line = buf.decode('utf-8', errors='replace').strip()
+                    buf = b""
+                    if line:
+                        m = re.match(
+                            r'(\d+)\s+bytes.*?,\s+[\d.]+\s+s,\s+([\d.]+\s*\S+)', line)
+                        if m:
+                            self._bytes = int(m.group(1))
+                            self._speed = m.group(2)
+                        else:
+                            m2 = re.match(r'(\d+)\s+bytes', line)
+                            if m2:
+                                self._bytes = int(m2.group(1))
+                else:
+                    buf += ch
+            rc = self._proc.wait()
+            if rc != 0 and not self._cancelled:
+                self._error = f"dd exited with code {rc}"
+        except Exception as e:
+            if not self._cancelled:
+                self._error = str(e)
+        self._done = True
+
+    def _poll(self):
+        if self._done:
+            if self._error:
+                messagebox.showerror("dd Error", self._error, parent=self)
+            self.destroy()
+            return
+        if self._total > 0 and self._bytes > 0:
+            pct = min(self._bytes / self._total, 1.0)
+            self._bar["value"] = int(pct * 1000)
+            self._lbl.config(
+                text=f"{fmt_size(self._bytes)} / {fmt_size(self._total)}"
+                     f"  ({pct*100:.1f}%)")
+        elif self._bytes > 0:
+            self._lbl.config(text=fmt_size(self._bytes))
+        if self._speed:
+            self._speed_lbl.config(text=f"Speed: {self._speed}")
+        self.after(300, self._poll)
+
+    def _cancel(self):
+        self._cancelled = True
+        if self._proc:
+            self._proc.terminate()
+        self.destroy()
+
+
 # ─── Main window ───────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
@@ -706,7 +803,8 @@ class App(tk.Tk):
         self.title("Amiga RDB Disk Partitioner")
         self.geometry("1100x700")
         self.minsize(900, 540)
-        self._disks   = []
+        self._disks       = []
+        self._image_files = []   # user-opened .img files treated as disks
         self._cur_disk = None
         self._rdb: Optional[RDBInfo] = None
         self._drag: Optional[dict] = None   # {"start": cyl, "end": cyl}
@@ -721,11 +819,16 @@ class App(tk.Tk):
         fm = tk.Menu(mb, tearoff=0)
         fm.add_command(label="Refresh Disks", command=self._refresh_disks, accelerator="F5")
         fm.add_separator()
+        fm.add_command(label="Open Image as Disk…", command=self._do_open_image)
+        fm.add_separator()
         fm.add_command(label="Quit", command=self.quit)
         mb.add_cascade(label="File", menu=fm)
         tm = tk.Menu(mb, tearoff=0)
         tm.add_command(label="Backup RDB Blocks…", command=self._do_backup_rdb)
         tm.add_command(label="Restore RDB Blocks…", command=self._do_restore_rdb)
+        tm.add_separator()
+        tm.add_command(label="Image Disk to File…", command=self._do_image_disk)
+        tm.add_command(label="Restore Disk from Image…", command=self._do_restore_image)
         mb.add_cascade(label="Tools", menu=tm)
         hm = tk.Menu(mb, tearoff=0)
         hm.add_command(label="About", command=self._about)
@@ -868,12 +971,20 @@ class App(tk.Tk):
     # ── Disk list ─────────────────────────────────────────────────────────────
     def _refresh_disks(self):
         self._disks = get_disks()
+        # Drop image files that have disappeared from disk
+        self._image_files = [d for d in self._image_files if os.path.exists(d["path"])]
         for row in self._dtree.get_children():
             self._dtree.delete(row)
         for d in self._disks:
             self._dtree.insert("", "end", iid=d["path"],
                                values=(d["name"], fmt_size(d["size"]), d["model"]))
-        if not self._disks:
+        for d in self._image_files:
+            self._dtree.insert("", "end", iid=d["path"],
+                               values=(d["name"], fmt_size(d["size"]), d["model"]),
+                               tags=("imgfile",))
+        self._dtree.tag_configure("imgfile", foreground="#0055cc")
+        total = len(self._disks) + len(self._image_files)
+        if not total:
             self._status.set("No disks found. Try running as root (sudo).")
         else:
             self._status.set(f"{len(self._disks)} disk(s) found. Select one.")
@@ -882,7 +993,8 @@ class App(tk.Tk):
         sel = self._dtree.selection()
         if not sel:
             return
-        self._cur_disk = next((d for d in self._disks if d["path"]==sel[0]), None)
+        self._cur_disk = next(
+            (d for d in self._disks + self._image_files if d["path"] == sel[0]), None)
         if not self._cur_disk:
             return
         dev = self._cur_disk["path"]
@@ -1286,6 +1398,36 @@ class App(tk.Tk):
                 foreground="#007700")
             self._status.set(f"RDB successfully written to {dev}.")
 
+    def _do_open_image(self):
+        path = filedialog.askopenfilename(
+            title="Open Disk Image as Drive",
+            filetypes=[("Disk image", "*.img *.hdf *.bin"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            size = os.path.getsize(path)
+        except OSError as e:
+            messagebox.showerror("Error", str(e))
+            return
+        if size == 0:
+            messagebox.showerror("Error", "Image file is empty.")
+            return
+        name = os.path.basename(path)
+        d = {"name": name, "path": path, "size": size, "model": path}
+        # Replace if already open
+        self._image_files = [x for x in self._image_files if x["path"] != path]
+        self._image_files.append(d)
+        if self._dtree.exists(path):
+            self._dtree.delete(path)
+        self._dtree.insert("", "end", iid=path,
+                           values=(name, fmt_size(size), path),
+                           tags=("imgfile",))
+        self._dtree.tag_configure("imgfile", foreground="#0055cc")
+        self._dtree.selection_set(path)
+        self._dtree.see(path)
+        self._on_disk_sel()
+
     def _do_backup_rdb(self):
         if not self._cur_disk:
             messagebox.showerror("No Disk Selected", "Select a disk first.")
@@ -1360,6 +1502,59 @@ class App(tk.Tk):
             f"Restored {n_blocks} block(s) to {dev}.\n\n"
             f"Re-select the disk to reload the RDB.")
         self._status.set(f"RDB restored from {os.path.basename(path)}. Re-select disk to refresh.")
+
+    def _do_image_disk(self):
+        if not self._cur_disk:
+            messagebox.showerror("No Disk Selected", "Select a disk first.")
+            return
+        dev  = self._cur_disk["path"]
+        size = self._cur_disk["size"]
+        path = filedialog.asksaveasfilename(
+            title="Save Disk Image",
+            defaultextension=".img",
+            filetypes=[("Disk image", "*.img"), ("All files", "*.*")])
+        if not path:
+            return
+        cmd = ["dd", f"if={dev}", f"of={path}", "bs=4M", "status=progress"]
+        dlg = _DDProgressDialog(self, f"Imaging {dev}…", cmd, size)
+        if dlg.success:
+            messagebox.showinfo("Image Complete",
+                f"Disk image saved to:\n{path}\n\n{fmt_size(size)}")
+            self._status.set(f"Disk image saved: {os.path.basename(path)}")
+
+    def _do_restore_image(self):
+        if not self._cur_disk:
+            messagebox.showerror("No Disk Selected", "Select a disk first.")
+            return
+        dev  = self._cur_disk["path"]
+        path = filedialog.askopenfilename(
+            title="Open Disk Image",
+            filetypes=[("Disk image", "*.img"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            img_size = os.path.getsize(path)
+        except OSError as e:
+            messagebox.showerror("Error", str(e))
+            return
+        if not messagebox.askyesno("Confirm Restore",
+                f"⚠  WARNING  ⚠\n\n"
+                f"This will overwrite ALL data on:\n\n"
+                f"  {dev}   ({fmt_size(self._cur_disk['size'])})\n\n"
+                f"Image size: {fmt_size(img_size)}\n\n"
+                f"THIS CANNOT BE UNDONE.\n\nContinue?", icon="warning"):
+            return
+        if not os.access(dev, os.W_OK):
+            messagebox.showerror("Permission Denied",
+                f"Cannot write to {dev}.\n\nRun this program with sudo.")
+            return
+        cmd = ["dd", f"if={path}", f"of={dev}", "bs=4M", "status=progress",
+               "oflag=dsync"]
+        dlg = _DDProgressDialog(self, f"Restoring to {dev}…", cmd, img_size)
+        if dlg.success:
+            messagebox.showinfo("Restore Complete",
+                f"Image restored to {dev}.\n\nRe-select the disk to reload.")
+            self._status.set(f"Image restored to {dev}. Re-select disk to refresh.")
 
     def _about(self):
         messagebox.showinfo("About AmigaDisk",
