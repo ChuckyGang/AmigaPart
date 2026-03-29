@@ -25,10 +25,10 @@ using sudo.
 
 
 Anyway Features:
-Lists all disks and let you initlize a RDB on any disk. 
-add/delete partitions, edit flags like buffers etc. (resize not possible)
-Backup/Restore of RDB Block.
-Read/Write image of disk.
-if writing image to a larger disk, you will be given possability of change gemoetry of disk so more space is usable.
-Edit partitions directly on image.
-Create image of wanted size.
+* Lists all disks and let you initlize a RDB on any disk. 
+* add/delete partitions, edit flags like buffers etc. (resize not possible)
+* Backup/Restore of RDB Block.
+* Read/Write image of disk.
+* if writing image to a larger disk, you will be given possability of change gemoetry of disk so more space is usable.
+* Edit partitions directly on image.
+* Create image of wanted size.
