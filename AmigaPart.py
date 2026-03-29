@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""AmigaDisk — Linux GUI tool for Amiga RDB (Rigid Disk Block) partitioning."""
+"""AmigaDisk — GUI tool for Amiga RDB (Rigid Disk Block) partitioning."""
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-import subprocess, struct, os, math, json, re, threading, queue
+import subprocess, struct, os, math, json, re, threading, queue, signal, sys
 from typing import List, Optional
+
+_IS_MACOS = sys.platform == "darwin"
 
 # ─── Constants ─────────────────────────────────────────────────────────────────
 RDSK_ID      = 0x5244534B   # "RDSK"
@@ -453,6 +455,12 @@ def build_lseg_blocks(fs: FilesystemInfo, first_block: int) -> list:
 # ─── Disk enumeration ──────────────────────────────────────────────────────────
 
 def get_disks() -> list:
+    if _IS_MACOS:
+        return _get_disks_macos()
+    return _get_disks_linux()
+
+
+def _get_disks_linux() -> list:
     try:
         r = subprocess.run(
             ["lsblk", "-b", "-d", "-o", "NAME,SIZE,MODEL,TYPE", "--json"],
@@ -467,6 +475,35 @@ def get_disks() -> list:
             model = (dev.get("model") or "").strip()
             result.append({"name": name, "path": f"/dev/{name}",
                             "size": size, "model": model})
+        return result
+    except Exception:
+        return []
+
+
+def _get_disks_macos() -> list:
+    import plistlib
+    try:
+        r = subprocess.run(
+            ["diskutil", "list", "-plist"],
+            capture_output=True, timeout=10)
+        data = plistlib.loads(r.stdout)
+        result = []
+        for disk in data.get("AllDisksAndPartitions", []):
+            identifier = disk.get("DeviceIdentifier", "")
+            if not identifier:
+                continue
+            try:
+                ri = subprocess.run(
+                    ["diskutil", "info", "-plist", identifier],
+                    capture_output=True, timeout=10)
+                info = plistlib.loads(ri.stdout)
+            except Exception:
+                info = {}
+            size  = int(info.get("TotalSize") or info.get("Size") or 0)
+            model = (info.get("MediaName") or info.get("IORegistryEntryName") or "").strip()
+            result.append({"name": identifier,
+                           "path": f"/dev/r{identifier}",
+                           "size": size, "model": model})
         return result
     except Exception:
         return []
@@ -1292,6 +1329,16 @@ class _DDProgressDialog(tk.Toplevel):
         try:
             self._proc = subprocess.Popen(cmd, stderr=subprocess.PIPE,
                                           stdout=subprocess.DEVNULL)
+            if _IS_MACOS:
+                # Send SIGINFO every second so BSD dd reports progress to stderr
+                def _siginfo_sender():
+                    while self._proc and self._proc.poll() is None:
+                        try:
+                            self._proc.send_signal(signal.SIGINFO)
+                        except (ProcessLookupError, OSError):
+                            break
+                        import time; time.sleep(1)
+                threading.Thread(target=_siginfo_sender, daemon=True).start()
             buf = b""
             while True:
                 ch = self._proc.stderr.read(1)
@@ -1301,15 +1348,25 @@ class _DDProgressDialog(tk.Toplevel):
                     line = buf.decode('utf-8', errors='replace').strip()
                     buf = b""
                     if line:
+                        # Linux GNU dd:  "1073741824 bytes (1.1 GB) copied, 5.0 s, 215 MB/s"
                         m = re.match(
                             r'(\d+)\s+bytes.*?,\s+[\d.]+\s+s,\s+([\d.]+\s*\S+)', line)
                         if m:
                             self._bytes = int(m.group(1))
                             self._speed = m.group(2)
                         else:
-                            m2 = re.match(r'(\d+)\s+bytes', line)
+                            # macOS BSD dd:  "1073741824 bytes transferred in 5.001 secs (214697... bytes/sec)"
+                            m2 = re.match(
+                                r'(\d+)\s+bytes\s+transferred\s+in\s+[\d.]+\s+secs\s+\(([\d.]+)\s+bytes/sec\)',
+                                line)
                             if m2:
                                 self._bytes = int(m2.group(1))
+                                speed_bps = float(m2.group(2))
+                                self._speed = fmt_size(int(speed_bps)) + "/s"
+                            else:
+                                m3 = re.match(r'(\d+)\s+bytes', line)
+                                if m3:
+                                    self._bytes = int(m3.group(1))
                 else:
                     buf += ch
             rc = self._proc.wait()
@@ -2220,7 +2277,9 @@ class App(tk.Tk):
             filetypes=[("Disk image", "*.img"), ("All files", "*.*")])
         if not path:
             return
-        cmd = ["dd", f"if={dev}", f"of={path}", "bs=4M", "status=progress"]
+        cmd = ["dd", f"if={dev}", f"of={path}", "bs=4m" if _IS_MACOS else "bs=4M"]
+        if not _IS_MACOS:
+            cmd.append("status=progress")
         dlg = _DDProgressDialog(self, f"Imaging {dev}…", cmd, size)
         if dlg.success:
             messagebox.showinfo("Image Complete",
@@ -2253,8 +2312,11 @@ class App(tk.Tk):
             messagebox.showerror("Permission Denied",
                 f"Cannot write to {dev}.\n\nRun this program with sudo.")
             return
-        cmd = ["dd", f"if={path}", f"of={dev}", "bs=4M", "status=progress",
-               "oflag=dsync"]
+        cmd = ["dd", f"if={path}", f"of={dev}", "bs=4m" if _IS_MACOS else "bs=4M"]
+        if _IS_MACOS:
+            cmd.append("conv=sync")
+        else:
+            cmd += ["status=progress", "oflag=dsync"]
         dlg = _DDProgressDialog(self, f"Restoring to {dev}…", cmd, img_size)
         if dlg.success:
             messagebox.showinfo("Restore Complete",
