@@ -44,13 +44,13 @@ BUFMEMTYPE_OPTS = [
 
 # SizeBlock: filesystem block size in longwords (bytes / 4)
 SIZEBLOCK_OPTS = [
-    ("512 B  (128 lw)",   128),
-    ("1 KB   (256 lw)",   256),
-    ("2 KB   (512 lw)",   512),
-    ("4 KB  (1024 lw)",  1024),
-    ("8 KB  (2048 lw)",  2048),
-    ("16 KB (4096 lw)",  4096),
-    ("32 KB (8192 lw)",  8192),
+    ("512 B",   128),
+    ("1 KB",    256),
+    ("2 KB",    512),
+    ("4 KB",   1024),
+    ("8 KB",   2048),
+    ("16 KB",  4096),
+    ("32 KB",  8192),
 ]
 
 
@@ -869,34 +869,33 @@ class AddPartitionDialog(tk.Toplevel):
             ("Interleave:", "0",                    "interleave", 8),
             ("BootBlocks:", "2",                    "bootblocks", 8),
         ])
-        # SizeBlock dropdown alongside BootBlocks (row 3, col 3)
-        tk.Label(self._adv_frame, text="Block size:", justify="right").grid(
-            row=3, column=3, sticky="e", padx=(8, 2), pady=2)
-        self._sizeblock_var = tk.StringVar(value=SIZEBLOCK_OPTS[0][0])
-        ttk.Combobox(self._adv_frame, textvariable=self._sizeblock_var,
-                     values=[lbl for lbl, _ in SIZEBLOCK_OPTS],
-                     state="readonly", width=16).grid(
-            row=3, column=4, sticky="w", padx=(0, 12), pady=2)
 
         # ── Parameters ────────────────────────────────────────────────────────
-        self._prm_frame = ttk.LabelFrame(f, text="Parameters")
-        self._prm_frame.grid(row=row, columnspan=2, sticky="ew", pady=(2, 4)); row += 1
-        fill_frame(self._prm_frame, [
+        prm = ttk.LabelFrame(f, text="Parameters")
+        prm.grid(row=row, columnspan=2, sticky="ew", pady=(2, 4)); row += 1
+        fill_frame(prm, [
             ("NumBuffer:",   "30",          "numbuffer",   8),
             ("MaxTransfer:", "0x7FFFFFFF",  "maxtransfer", 12),
             ("Mask:",        "0xFFFFFFFE",  "mask",        12),
         ])
-        # BufMemType as dropdown (row 1, col 3 — alongside Mask)
-        tk.Label(self._prm_frame, text="BufMemType:", justify="right").grid(
+        # BufMemType dropdown (row 1, col 3 — alongside Mask)
+        tk.Label(prm, text="BufMemType:", justify="right").grid(
             row=1, column=3, sticky="e", padx=(8, 2), pady=2)
-        self._bufmemtype_var = tk.StringVar(value=BUFMEMTYPE_OPTS[1][0])  # default: Public
-        ttk.Combobox(self._prm_frame, textvariable=self._bufmemtype_var,
+        self._bufmemtype_var = tk.StringVar(value=BUFMEMTYPE_OPTS[1][0])
+        ttk.Combobox(prm, textvariable=self._bufmemtype_var,
                      values=[lbl for lbl, _ in BUFMEMTYPE_OPTS],
                      state="readonly", width=14).grid(
             row=1, column=4, sticky="w", padx=(0, 12), pady=2)
+        # Block Size dropdown (row 2, col 0)
+        tk.Label(prm, text="Block size:", justify="right").grid(
+            row=2, column=0, sticky="e", padx=(8, 2), pady=2)
+        self._sizeblock_var = tk.StringVar(value=SIZEBLOCK_OPTS[0][0])
+        ttk.Combobox(prm, textvariable=self._sizeblock_var,
+                     values=[lbl for lbl, _ in SIZEBLOCK_OPTS],
+                     state="readonly", width=14).grid(
+            row=2, column=1, sticky="w", padx=(0, 12), pady=2)
 
         self._adv_frame.grid_remove()
-        self._prm_frame.grid_remove()
 
         bf = tk.Frame(f)
         bf.grid(row=row, columnspan=2, pady=(8,0))
@@ -906,10 +905,8 @@ class AddPartitionDialog(tk.Toplevel):
     def _toggle_adv(self):
         if self._adv_var.get():
             self._adv_frame.grid()
-            self._prm_frame.grid()
         else:
             self._adv_frame.grid_remove()
-            self._prm_frame.grid_remove()
         self.update_idletasks()
         self.geometry("")
 
@@ -1122,30 +1119,16 @@ class EditPartitionDialog(tk.Toplevel):
             ("Interleave:", str(p.interleave),   "interleave", 8),
             ("BootBlocks:", str(p.boot_blocks),  "bootblocks", 8),
         ])
-        # SizeBlock dropdown alongside BootBlocks (row 3, col 3)
-        tk.Label(self._adv_frame, text="Block size:", justify="right").grid(
-            row=3, column=3, sticky="e", padx=(8, 2), pady=2)
-        _sb_default = next((lbl for lbl, v in SIZEBLOCK_OPTS if v == p.size_block),
-                           f"Custom ({p.size_block})")
-        self._sizeblock_var = tk.StringVar(value=_sb_default)
-        _sb_values = [lbl for lbl, _ in SIZEBLOCK_OPTS]
-        if _sb_default not in _sb_values:
-            _sb_values = [_sb_default] + _sb_values
-        ttk.Combobox(self._adv_frame, textvariable=self._sizeblock_var,
-                     values=_sb_values,
-                     state="readonly", width=16).grid(
-            row=3, column=4, sticky="w", padx=(0, 12), pady=2)
-
         # ── Parameters ────────────────────────────────────────────────────────
-        self._prm_frame = ttk.LabelFrame(f, text="Parameters")
-        self._prm_frame.grid(row=row, columnspan=2, sticky="ew", pady=(2, 4)); row += 1
-        fill_frame(self._prm_frame, [
+        prm = ttk.LabelFrame(f, text="Parameters")
+        prm.grid(row=row, columnspan=2, sticky="ew", pady=(2, 4)); row += 1
+        fill_frame(prm, [
             ("NumBuffer:",   str(p.num_buffer),          "numbuffer",   8),
             ("MaxTransfer:", f"0x{p.max_transfer:08X}",  "maxtransfer", 12),
             ("Mask:",        f"0x{p.mask:08X}",          "mask",        12),
         ])
-        # BufMemType as dropdown (row 1, col 3 — alongside Mask)
-        tk.Label(self._prm_frame, text="BufMemType:", justify="right").grid(
+        # BufMemType dropdown (row 1, col 3 — alongside Mask)
+        tk.Label(prm, text="BufMemType:", justify="right").grid(
             row=1, column=3, sticky="e", padx=(8, 2), pady=2)
         _bmt_default = next((lbl for lbl, v in BUFMEMTYPE_OPTS if v == p.buf_mem_type),
                             f"Custom ({p.buf_mem_type})")
@@ -1153,13 +1136,25 @@ class EditPartitionDialog(tk.Toplevel):
         _bmt_values = [lbl for lbl, _ in BUFMEMTYPE_OPTS]
         if _bmt_default not in _bmt_values:
             _bmt_values = [_bmt_default] + _bmt_values
-        ttk.Combobox(self._prm_frame, textvariable=self._bufmemtype_var,
+        ttk.Combobox(prm, textvariable=self._bufmemtype_var,
                      values=_bmt_values,
                      state="readonly", width=14).grid(
             row=1, column=4, sticky="w", padx=(0, 12), pady=2)
+        # Block Size dropdown (row 2, col 0)
+        tk.Label(prm, text="Block size:", justify="right").grid(
+            row=2, column=0, sticky="e", padx=(8, 2), pady=2)
+        _sb_default = next((lbl for lbl, v in SIZEBLOCK_OPTS if v == p.size_block),
+                           f"Custom ({p.size_block})")
+        self._sizeblock_var = tk.StringVar(value=_sb_default)
+        _sb_values = [lbl for lbl, _ in SIZEBLOCK_OPTS]
+        if _sb_default not in _sb_values:
+            _sb_values = [_sb_default] + _sb_values
+        ttk.Combobox(prm, textvariable=self._sizeblock_var,
+                     values=_sb_values,
+                     state="readonly", width=14).grid(
+            row=2, column=1, sticky="w", padx=(0, 12), pady=2)
 
         self._adv_frame.grid_remove()
-        self._prm_frame.grid_remove()
 
         bf = tk.Frame(f)
         bf.grid(row=row, columnspan=2, pady=(8, 0))
@@ -1169,10 +1164,8 @@ class EditPartitionDialog(tk.Toplevel):
     def _toggle_adv(self):
         if self._adv_var.get():
             self._adv_frame.grid()
-            self._prm_frame.grid()
         else:
             self._adv_frame.grid_remove()
-            self._prm_frame.grid_remove()
         self.update_idletasks()
         self.geometry("")
 
