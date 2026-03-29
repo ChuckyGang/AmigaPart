@@ -1032,6 +1032,19 @@ class EditPartitionDialog(tk.Toplevel):
         self._size_lbl = tk.Label(f, text="", fg="#336699")
         self._size_lbl.grid(row=row, columnspan=2, sticky="w"); row += 1
 
+        # ── Resize slider ──────────────────────────────────────────────────────
+        self._slider_busy = False
+        orig_cyls = p.high_cyl - p.low_cyl + 1
+        max_cyls  = max(1, self._max_hi - p.low_cyl + 1)
+        rsz = ttk.LabelFrame(f, text="Resize")
+        rsz.grid(row=row, columnspan=2, sticky="ew", pady=(4, 2)); row += 1
+        self._slider_var = tk.IntVar(value=orig_cyls)
+        tk.Scale(rsz, variable=self._slider_var, from_=1, to=max_cyls,
+                 orient="horizontal", showvalue=False, length=400,
+                 command=self._on_slider).pack(fill="x", padx=8, pady=(6, 0))
+        self._resize_lbl = tk.Label(rsz, text="", fg="gray")
+        self._resize_lbl.pack(anchor="w", padx=8, pady=(0, 4))
+
         for key in ("lo", "hi"):
             self._vars[key].trace_add("write", self._upd_size)
         self._upd_size()
@@ -1094,8 +1107,43 @@ class EditPartitionDialog(tk.Toplevel):
             cyls = hi - lo + 1
             sz = cyls * self._rdb.heads * self._rdb.sectors * 512
             self._size_lbl.config(text=f"Size: {fmt_size(sz)}  ({cyls} cylinders)")
+            if not self._slider_busy:
+                self._slider_busy = True
+                try:
+                    max_cyls = max(1, self._max_hi - lo + 1)
+                    self._slider_var.set(max(1, min(cyls, max_cyls)))
+                    self._upd_resize_lbl(cyls)
+                finally:
+                    self._slider_busy = False
         except ValueError:
             self._size_lbl.config(text="")
+
+    def _on_slider(self, val):
+        if self._slider_busy:
+            return
+        self._slider_busy = True
+        try:
+            cyls = int(float(val))
+            try:
+                lo = int(self._vars["lo"].get())
+            except ValueError:
+                lo = self._orig.low_cyl
+            self._vars["hi"].set(str(lo + cyls - 1))
+            self._upd_resize_lbl(cyls)
+        finally:
+            self._slider_busy = False
+
+    def _upd_resize_lbl(self, cyls):
+        orig_cyls = self._orig.high_cyl - self._orig.low_cyl + 1
+        sz = fmt_size(cyls * self._rdb.heads * self._rdb.sectors * 512)
+        if cyls < orig_cyls:
+            self._resize_lbl.config(
+                text=f"WARNING: Shrinking to {sz} ({cyls} cyl) — data WILL be lost!",
+                fg="red")
+        elif cyls > orig_cyls:
+            self._resize_lbl.config(text=f"Expanding to {sz} ({cyls} cyl)", fg="#336699")
+        else:
+            self._resize_lbl.config(text=f"Current size: {sz} ({cyls} cyl)", fg="gray")
 
     def _ok(self):
         name = self._vars["name"].get().strip()
