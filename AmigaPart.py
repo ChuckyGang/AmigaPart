@@ -1577,6 +1577,23 @@ class App(tk.Tk):
         self._info["size"].config(text=fmt_size(self._cur_disk["size"]), foreground="black")
 
         if self._rdb:
+            # Check if physical disk is larger than RDB geometry describes
+            cyl_bytes = self._rdb.heads * self._rdb.sectors * 512
+            if cyl_bytes > 0:
+                phys_cyls = self._cur_disk["size"] // cyl_bytes
+                if phys_cyls > self._rdb.cylinders:
+                    rdb_size  = fmt_size(self._rdb.cylinders * cyl_bytes)
+                    phys_size = fmt_size(self._cur_disk["size"])
+                    ans = messagebox.askyesno(
+                        "Disk Larger Than RDB",
+                        f"The physical disk ({phys_size}) is larger than the RDB geometry describes ({rdb_size}).\n\n"
+                        f"RDB cylinder count: {self._rdb.cylinders}  →  physical: {phys_cyls}\n\n"
+                        f"Expand RDB geometry to use the full disk?\n"
+                        f"(You can then add a new partition in the free space.)")
+                    if ans:
+                        self._rdb.cylinders = phys_cyls
+                        self._rdb.hicyl     = phys_cyls - 1
+
             geo = f"{self._rdb.cylinders}C × {self._rdb.heads}H × {self._rdb.sectors}S"
             self._info["geo"].config(text=geo, foreground="black")
             self._info["rdb"].config(
