@@ -1203,6 +1203,13 @@ class App(tk.Tk):
             return
         cyl = self._map_x_to_cyl(event.x)
         if not self._cyl_is_free(cyl):
+            for i, p in enumerate(self._rdb.partitions):
+                if p.low_cyl <= cyl <= p.high_cyl:
+                    self._ptree.selection_set(str(i))
+                    self._ptree.focus(str(i))
+                    self._ptree.see(str(i))
+                    self._on_part_sel()
+                    break
             return
         # Snap start to the left edge of this free block
         snap = self._rdb.locyl
