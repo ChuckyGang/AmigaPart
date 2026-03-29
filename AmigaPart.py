@@ -423,13 +423,16 @@ class InitRDBDialog(tk.Toplevel):
 
 
 class AddPartitionDialog(tk.Toplevel):
-    def __init__(self, parent, rdb: RDBInfo):
+    def __init__(self, parent, rdb: RDBInfo,
+                 preset_lo: int = None, preset_hi: int = None):
         super().__init__(parent)
         self.title("Add Partition")
         self.resizable(False, False)
         self.grab_set()
         self.result: Optional[PartitionInfo] = None
         self._rdb = rdb
+        self._preset_lo = preset_lo
+        self._preset_hi = preset_hi
         self._build()
         self.transient(parent)
         self.wait_window()
@@ -443,6 +446,8 @@ class AddPartitionDialog(tk.Toplevel):
         return "DH0"
 
     def _find_free(self):
+        if self._preset_lo is not None:
+            return self._preset_lo, self._preset_hi if self._preset_hi is not None else self._rdb.hicyl
         used = sorted((p.low_cyl, p.high_cyl) for p in self._rdb.partitions)
         candidate = self._rdb.locyl
         for lo, hi in used:
@@ -555,6 +560,7 @@ class App(tk.Tk):
         self._disks   = []
         self._cur_disk = None
         self._rdb: Optional[RDBInfo] = None
+        self._drag: Optional[dict] = None   # {"start": cyl, "end": cyl}
         self._build_menu()
         self._build_ui()
         self.after(100, self._refresh_disks)
@@ -648,7 +654,11 @@ class App(tk.Tk):
 
         self._canvas = tk.Canvas(map_lf, height=66, bg="#1a1a2e", highlightthickness=0)
         self._canvas.pack(fill="x", padx=6, pady=6)
-        self._canvas.bind("<Configure>", lambda _: self._draw_map())
+        self._canvas.bind("<Configure>",       lambda _: self._draw_map())
+        self._canvas.bind("<Motion>",          self._on_map_hover)
+        self._canvas.bind("<Button-1>",        self._on_map_press)
+        self._canvas.bind("<B1-Motion>",       self._on_map_drag)
+        self._canvas.bind("<ButtonRelease-1>", self._on_map_release)
 
         # Partition list
         part_lf = ttk.LabelFrame(right, text="Partitions")
@@ -745,9 +755,14 @@ class App(tk.Tk):
 
     # ── Partition list ────────────────────────────────────────────────────────
     def _refresh_parts(self):
+        # Remember current selection index so we can restore it
+        cur = self._ptree.selection()
+        prev_idx = int(cur[0]) if cur else None
+
         for row in self._ptree.get_children():
             self._ptree.delete(row)
         if not self._rdb:
+            self._on_part_sel()
             return
         for i, p in enumerate(self._rdb.partitions):
             flags = "Boot" if p.flags == 0 else f"0x{p.flags:02X}"
@@ -757,10 +772,18 @@ class App(tk.Tk):
                                        p.boot_pri, flags),
                                tags=(f"c{i%len(COLORS)}",))
         for i, c in enumerate(COLORS):
-            # Lighten the color for row background
             r,g,b = int(c[1:3],16),int(c[3:5],16),int(c[5:7],16)
             bg = f"#{min(r+160,255):02x}{min(g+160,255):02x}{min(b+160,255):02x}"
             self._ptree.tag_configure(f"c{i}", background=bg)
+
+        # Restore selection (or pick first row) so delete button stays correct
+        kids = self._ptree.get_children()
+        if kids:
+            target = str(min(prev_idx, len(kids) - 1)) if prev_idx is not None else kids[0]
+            self._ptree.selection_set(target)
+            self._ptree.focus(target)
+            self._ptree.see(target)
+        self._on_part_sel()
 
     def _on_part_sel(self, _=None):
         self._btn_del.config(
@@ -815,9 +838,28 @@ class App(tk.Tk):
             c.create_rectangle(px1, y1, px2, y2, fill=col, outline="#111122", width=1)
             pw = px2 - px1
             if pw > 18:
+                max_chars = max(1, int((pw - 8) / 6))
+                label = p.drive_name if len(p.drive_name) <= max_chars else p.drive_name[:max_chars]
                 c.create_text((px1+px2)/2, (y1+y2)/2,
-                              text=p.drive_name, fill="white",
-                              font=("",8,"bold"), width=int(pw-4))
+                              text=label, fill="white",
+                              font=("",8,"bold"))
+
+        # Ghost partition (drag-to-create)
+        if self._drag is not None:
+            lo = min(self._drag["start"], self._drag["end"])
+            hi = max(self._drag["start"], self._drag["end"])
+            gx1 = x_of(lo)
+            gx2 = x_of(hi + 1)
+            if gx2 < gx1 + 2:
+                gx2 = gx1 + 2
+            c.create_rectangle(gx1, y1, gx2, y2,
+                                fill="#334466", outline="white", dash=(4, 2), width=2)
+            gpw = gx2 - gx1
+            if gpw > 28:
+                cyls = hi - lo + 1
+                sz_str = fmt_size(cyls * self._rdb.heads * self._rdb.sectors * 512)
+                c.create_text((gx1 + gx2) / 2, (y1 + y2) / 2,
+                               text=sz_str, fill="white", font=("", 8, "bold"))
 
         # Axis labels
         c.create_text(M,   H-2, text=f"Cyl {self._rdb.locyl}",
@@ -832,6 +874,96 @@ class App(tk.Tk):
         free_mb = free_cyls * self._rdb.heads * self._rdb.sectors * 512
         c.create_text(W//2, H-2, text=f"Free: {fmt_size(free_mb)}",
                       fill="#8888aa", font=("",7), anchor="s")
+
+    # ── Canvas drag-to-create ─────────────────────────────────────────────────
+    def _map_x_to_cyl(self, x: int) -> int:
+        M = 6
+        bw = self._canvas.winfo_width() - 2 * M
+        total = self._rdb.hicyl - self._rdb.locyl + 1
+        if bw <= 0 or total <= 0:
+            return self._rdb.locyl
+        cyl = self._rdb.locyl + int((x - M) / bw * total)
+        return max(self._rdb.locyl, min(self._rdb.hicyl, cyl))
+
+    def _cyl_is_free(self, cyl: int) -> bool:
+        for p in self._rdb.partitions:
+            if p.low_cyl <= cyl <= p.high_cyl:
+                return False
+        return True
+
+    def _on_map_hover(self, event):
+        if not self._rdb:
+            self._canvas.config(cursor=""); return
+        H = self._canvas.winfo_height()
+        if not (6 <= event.y <= H - 18):
+            self._canvas.config(cursor=""); return
+        self._canvas.config(
+            cursor="crosshair" if self._cyl_is_free(self._map_x_to_cyl(event.x)) else "")
+
+    def _on_map_press(self, event):
+        if not self._rdb:
+            return
+        H = self._canvas.winfo_height()
+        if not (6 <= event.y <= H - 18):
+            return
+        cyl = self._map_x_to_cyl(event.x)
+        if not self._cyl_is_free(cyl):
+            return
+        # Snap start to the left edge of this free block
+        snap = self._rdb.locyl
+        for p in self._rdb.partitions:
+            if p.high_cyl < cyl:
+                snap = max(snap, p.high_cyl + 1)
+        self._drag = {"start": snap, "end": snap}
+        self._draw_map()
+
+    def _clamp_drag_end(self, start: int, raw_end: int) -> int:
+        """Clamp raw_end so the range [start, end] stays entirely in free space."""
+        if raw_end >= start:
+            limit = self._rdb.hicyl
+            for p in self._rdb.partitions:
+                if p.low_cyl > start:
+                    limit = min(limit, p.low_cyl - 1)
+            return min(raw_end, limit)
+        else:
+            limit = self._rdb.locyl
+            for p in self._rdb.partitions:
+                if p.high_cyl < start:
+                    limit = max(limit, p.high_cyl + 1)
+            return max(raw_end, limit)
+
+    def _on_map_drag(self, event):
+        if self._drag is None:
+            return
+        raw = self._map_x_to_cyl(event.x)
+        self._drag["end"] = self._clamp_drag_end(self._drag["start"], raw)
+        lo = min(self._drag["start"], self._drag["end"])
+        hi = max(self._drag["start"], self._drag["end"])
+        cyls = hi - lo + 1
+        sz = cyls * self._rdb.heads * self._rdb.sectors * 512
+        self._status.set(f"New partition: cyls {lo}–{hi}  ({cyls} cylinder{'s' if cyls != 1 else ''}, {fmt_size(sz)})")
+        self._draw_map()
+
+    def _on_map_release(self, event):
+        if self._drag is None:
+            return
+        raw = self._map_x_to_cyl(event.x)
+        clamped = self._clamp_drag_end(self._drag["start"], raw)
+        lo = min(self._drag["start"], clamped)
+        hi = max(self._drag["start"], clamped)
+        self._drag = None
+        self._draw_map()
+        if not self._rdb:
+            return
+        dlg = AddPartitionDialog(self, self._rdb, preset_lo=lo, preset_hi=hi)
+        if dlg.result:
+            self._rdb.partitions.append(dlg.result)
+            self._refresh_parts()
+            self._draw_map()
+            self._status.set(
+                f"Partition '{dlg.result.drive_name}' added. Write to disk to save changes.")
+        else:
+            self._status.set("Partition add cancelled.")
 
     # ── Actions ───────────────────────────────────────────────────────────────
     def _do_init(self):
