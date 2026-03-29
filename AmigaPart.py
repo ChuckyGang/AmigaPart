@@ -9,8 +9,11 @@ from typing import List, Optional
 # ─── Constants ─────────────────────────────────────────────────────────────────
 RDSK_ID      = 0x5244534B   # "RDSK"
 PART_ID      = 0x50415254   # "PART"
+FSHD_ID      = 0x46534844   # "FSHD"
+LSEG_ID      = 0x4C534547   # "LSEG"
 END_MARK     = 0xFFFFFFFF
 RDB_SCAN_LIMIT = 16
+LSEG_DATA    = 492          # payload bytes per LSEG block (512 − 5 longs)
 
 FS_TYPES = {
     0x444F5300: "OFS",        0x444F5301: "FFS",
@@ -60,7 +63,52 @@ class PartitionInfo:
 
     @property
     def fs_name(self):
-        return FS_TYPES.get(self.dos_type, f"0x{self.dos_type:08X}")
+        return _dostype_label(self.dos_type)
+
+
+def _rdb_fs_menu(rdb) -> list:
+    """Return FS_MENU extended with any custom filesystems stored in this RDB."""
+    known = {v for _, v in FS_MENU}
+    extra = [(f"{fs.label} — External", fs.dos_type)
+             for fs in (rdb.filesystems if rdb else [])
+             if fs.dos_type not in known]
+    return FS_MENU + extra
+
+
+def _dostype_label(dos_type: int) -> str:
+    """Return a human-readable label for an arbitrary DosType, e.g. 0x50465303 → 'PFS\\3'."""
+    known = FS_TYPES.get(dos_type)
+    if known:
+        return known
+    chars = []
+    for i in range(3):
+        b = (dos_type >> (24 - i * 8)) & 0xFF
+        chars.append(chr(b) if 32 <= b < 127 else '?')
+    ver = dos_type & 0xFF
+    return f"{''.join(chars)}\\{ver}"
+
+
+class FilesystemInfo:
+    def __init__(self):
+        self.block_num    = -1
+        self.dos_type     = 0
+        self.version      = 0        # hi word = major, lo word = minor
+        self.patch_flags  = 0x180    # SegListBlk + GlobalVec valid
+        self.stack_size   = 4096
+        self.priority     = 0
+        self.startup      = 0
+        self.global_vec   = 0xFFFFFFFF
+        self.data         = b""      # raw filesystem binary (LSEG payload)
+
+    @property
+    def label(self) -> str:
+        return _dostype_label(self.dos_type)
+
+    @property
+    def version_str(self) -> str:
+        major = (self.version >> 16) & 0xFFFF
+        minor = self.version & 0xFFFF
+        return f"{major}.{minor}"
 
 
 class RDBInfo:
@@ -81,7 +129,8 @@ class RDBInfo:
         self.part_list_blk  = END_MARK
         self.fshdr_list     = END_MARK
         self.bad_block      = END_MARK
-        self.partitions: List[PartitionInfo] = []
+        self.partitions:  List[PartitionInfo]  = []
+        self.filesystems: List[FilesystemInfo] = []
 
 
 # ─── Binary helpers ────────────────────────────────────────────────────────────
@@ -219,6 +268,45 @@ def read_rdb(dev: str) -> Optional[RDBInfo]:
         rdb.partitions.append(p)
         next_blk = p.next_part
 
+    # Walk filesystem header linked list
+    next_blk = rdb.fshdr_list
+    seen = set()
+    while next_blk != END_MARK and next_blk not in seen:
+        seen.add(next_blk)
+        data = _read_block(dev, next_blk)
+        if data is None or len(data) < 128:
+            break
+        if struct.unpack_from(">I", data, 0)[0] != FSHD_ID:
+            break
+
+        fs               = FilesystemInfo()
+        fs.block_num     = next_blk
+        next_fshd        = struct.unpack_from(">I", data, 16)[0]
+        fs.dos_type      = struct.unpack_from(">I", data, 32)[0]
+        fs.version       = struct.unpack_from(">I", data, 36)[0]
+        fs.patch_flags   = struct.unpack_from(">I", data, 40)[0]
+        fs.stack_size    = struct.unpack_from(">I", data, 60)[0]
+        fs.priority      = struct.unpack_from(">I", data, 64)[0]
+        fs.startup       = struct.unpack_from(">I", data, 68)[0]
+        first_lseg       = struct.unpack_from(">I", data, 72)[0]
+        fs.global_vec    = struct.unpack_from(">I", data, 76)[0]
+
+        # Reassemble binary from LSEG chain
+        lseg_data = bytearray()
+        lseg_blk  = first_lseg
+        lseg_seen = set()
+        while lseg_blk != END_MARK and lseg_blk not in lseg_seen:
+            lseg_seen.add(lseg_blk)
+            ldata = _read_block(dev, lseg_blk)
+            if ldata is None or struct.unpack_from(">I", ldata, 0)[0] != LSEG_ID:
+                break
+            lseg_data.extend(ldata[20:512])
+            lseg_blk = struct.unpack_from(">I", ldata, 16)[0]
+        fs.data = bytes(lseg_data)
+
+        rdb.filesystems.append(fs)
+        next_blk = next_fshd
+
     return rdb
 
 
@@ -234,7 +322,7 @@ def build_rdsk_block(rdb: RDBInfo) -> bytes:
     struct.pack_into(">I", d,  20, rdb.flags)
     struct.pack_into(">I", d,  24, END_MARK)       # BadBlockList
     struct.pack_into(">I", d,  28, rdb.part_list_blk)
-    struct.pack_into(">I", d,  32, END_MARK)       # FileSysHeaderList
+    struct.pack_into(">I", d,  32, rdb.fshdr_list)  # FileSysHeaderList
     struct.pack_into(">I", d,  36, END_MARK)       # DriveInit
     struct.pack_into(">I", d,  40, END_MARK)       # BootBlockList
     for i in range(5):                              # Reserved1[5]
@@ -312,6 +400,54 @@ def build_part_block(p: PartitionInfo, rdb_heads: int, rdb_sectors: int) -> byte
 
     _fix_checksum(d, 8)
     return bytes(d)
+
+
+def build_fshd_block(fs: FilesystemInfo, next_fshd: int, first_lseg: int) -> bytes:
+    d = bytearray(512)
+    struct.pack_into(">I", d,  0, FSHD_ID)
+    struct.pack_into(">I", d,  4, 128)
+    struct.pack_into(">I", d,  8, 0)
+    struct.pack_into(">I", d, 12, 7)              # HostID
+    struct.pack_into(">I", d, 16, next_fshd)
+    struct.pack_into(">I", d, 20, 0)              # Flags
+    struct.pack_into(">I", d, 24, END_MARK)       # Reserved[0]
+    struct.pack_into(">I", d, 28, END_MARK)       # Reserved[1]
+    struct.pack_into(">I", d, 32, fs.dos_type)
+    struct.pack_into(">I", d, 36, fs.version)
+    struct.pack_into(">I", d, 40, fs.patch_flags)
+    # DevNode
+    struct.pack_into(">I", d, 44, 0)              # Type
+    struct.pack_into(">I", d, 48, 0)              # Task
+    struct.pack_into(">I", d, 52, 0)              # Lock
+    struct.pack_into(">I", d, 56, 0)              # Handler
+    struct.pack_into(">I", d, 60, fs.stack_size)
+    struct.pack_into(">I", d, 64, fs.priority)
+    struct.pack_into(">I", d, 68, fs.startup)
+    struct.pack_into(">I", d, 72, first_lseg)     # SegListBlk
+    struct.pack_into(">I", d, 76, fs.global_vec)
+    _fix_checksum(d, 8)
+    return bytes(d)
+
+
+def build_lseg_blocks(fs: FilesystemInfo, first_block: int) -> list:
+    """Return list of (block_num, bytes) for the LSEG chain."""
+    data   = fs.data or b""
+    n      = max(1, math.ceil(len(data) / LSEG_DATA)) if data else 0
+    result = []
+    for i in range(n):
+        blk      = first_block + i
+        next_blk = first_block + i + 1 if i + 1 < n else END_MARK
+        chunk    = data[i * LSEG_DATA:(i + 1) * LSEG_DATA]
+        d = bytearray(512)
+        struct.pack_into(">I", d,  0, LSEG_ID)
+        struct.pack_into(">I", d,  4, 128)
+        struct.pack_into(">I", d,  8, 0)
+        struct.pack_into(">I", d, 12, 7)
+        struct.pack_into(">I", d, 16, next_blk)
+        d[20:20 + len(chunk)] = chunk
+        _fix_checksum(d, 8)
+        result.append((blk, bytes(d)))
+    return result
 
 
 # ─── Disk enumeration ──────────────────────────────────────────────────────────
@@ -484,10 +620,11 @@ class AddPartitionDialog(tk.Toplevel):
         tk.Label(f, text=f"(usable: {self._rdb.locyl}–{self._rdb.hicyl})",
                  fg="gray", font=("",8)).grid(row=row, columnspan=2, sticky="w"); row+=1
 
+        fs_menu = _rdb_fs_menu(self._rdb)
         tk.Label(f, text="Filesystem:").grid(row=row, column=0, sticky="e", pady=3)
-        self._fs_var = tk.StringVar(value=FS_MENU[0][0])
+        self._fs_var = tk.StringVar(value=fs_menu[0][0])
         ttk.Combobox(f, textvariable=self._fs_var,
-                     values=[x[0] for x in FS_MENU],
+                     values=[x[0] for x in fs_menu],
                      state="readonly", width=30).grid(row=row, column=1, sticky="w", pady=3)
         row += 1
 
@@ -584,7 +721,7 @@ class AddPartitionDialog(tk.Toplevel):
                     f"Overlaps with existing partition {p.drive_name}.", parent=self)
                 return
 
-        dos_type = next(v for n,v in FS_MENU if n == self._fs_var.get())
+        dos_type = next(v for n,v in _rdb_fs_menu(self._rdb) if n == self._fs_var.get())
 
         p = PartitionInfo()
         p.drive_name   = name
@@ -672,11 +809,12 @@ class EditPartitionDialog(tk.Toplevel):
         lbl_entry("Low cylinder:",  str(p.low_cyl),  "lo",   10)
         lbl_entry("High cylinder:", str(p.high_cyl), "hi",   10)
 
+        fs_menu = _rdb_fs_menu(self._rdb)
         tk.Label(f, text="Filesystem:").grid(row=row, column=0, sticky="e", pady=3)
         self._fs_var = tk.StringVar(
-            value=next((n for n, v in FS_MENU if v == p.dos_type), FS_MENU[0][0]))
+            value=next((n for n, v in fs_menu if v == p.dos_type), fs_menu[0][0]))
         ttk.Combobox(f, textvariable=self._fs_var,
-                     values=[x[0] for x in FS_MENU],
+                     values=[x[0] for x in fs_menu],
                      state="readonly", width=30).grid(row=row, column=1, sticky="w", pady=3)
         row += 1
 
@@ -785,7 +923,7 @@ class EditPartitionDialog(tk.Toplevel):
         p.drive_name   = name
         p.low_cyl      = lo
         p.high_cyl     = hi
-        p.dos_type     = next(v for n, v in FS_MENU if n == self._fs_var.get())
+        p.dos_type     = next(v for n, v in _rdb_fs_menu(self._rdb) if n == self._fs_var.get())
         p.boot_pri     = bp
         p.flags        = 0 if self._bootable_var.get() else 2
         p.surfaces     = surfaces
@@ -800,6 +938,170 @@ class EditPartitionDialog(tk.Toplevel):
         p.mask         = mask
         p.boot_blocks  = bootblocks
         self.result = p
+        self.destroy()
+
+
+# ─── Add filesystem dialog ─────────────────────────────────────────────────────
+
+# Common external filesystem DosTypes offered as presets
+_FS_PRESETS = [
+    ("PFS\\3  — Professional File System 3", 0x50465303),
+    ("PFS\\2  — Professional File System 2", 0x50465302),
+    ("PFS\\1  — Professional File System 1", 0x50465301),
+    ("SFS\\0  — Smart File System",           0x53465300),
+    ("SFS\\2  — Smart File System 2",         0x53465302),
+    ("FAT\\0  — FAT95",                       0x46415400),
+    ("Custom (enter DosType below)",          0),
+]
+
+class AddFilesystemDialog(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Add Filesystem to RDB")
+        self.resizable(False, False)
+        self.grab_set()
+        self.transient(parent)
+        self.result: Optional[FilesystemInfo] = None
+        self._build()
+        self.wait_window()
+
+    def _build(self):
+        f = tk.Frame(self, padx=14, pady=12)
+        f.pack(fill="both", expand=True)
+        row = 0
+
+        # Filesystem binary
+        tk.Label(f, text="Filesystem binary:", justify="right").grid(
+            row=row, column=0, sticky="e", pady=3)
+        self._path_var = tk.StringVar()
+        tk.Entry(f, textvariable=self._path_var, width=36).grid(
+            row=row, column=1, sticky="ew", pady=3)
+        tk.Button(f, text="Browse…", command=self._browse).grid(
+            row=row, column=2, padx=(4,0), pady=3)
+        row += 1
+
+        # Preset selector
+        tk.Label(f, text="Filesystem type:", justify="right").grid(
+            row=row, column=0, sticky="e", pady=3)
+        self._preset_var = tk.StringVar(value=_FS_PRESETS[0][0])
+        cb = ttk.Combobox(f, textvariable=self._preset_var,
+                          values=[x[0] for x in _FS_PRESETS],
+                          state="readonly", width=38)
+        cb.grid(row=row, column=1, columnspan=2, sticky="w", pady=3)
+        cb.bind("<<ComboboxSelected>>", self._on_preset)
+        row += 1
+
+        # DosType hex entry + ASCII preview
+        tk.Label(f, text="DosType (hex):", justify="right").grid(
+            row=row, column=0, sticky="e", pady=3)
+        self._dostype_var = tk.StringVar(value=f"0x{_FS_PRESETS[0][1]:08X}")
+        tk.Entry(f, textvariable=self._dostype_var, width=14).grid(
+            row=row, column=1, sticky="w", pady=3)
+        self._dostype_preview = tk.Label(f, text="", fg="#336699", font=("Monospace", 10))
+        self._dostype_preview.grid(row=row, column=2, sticky="w", padx=(6, 0))
+        self._dostype_var.trace_add("write", self._upd_dostype_preview)
+        self._upd_dostype_preview()
+        row += 1
+
+        # Version
+        tk.Label(f, text="Version (major.minor):", justify="right").grid(
+            row=row, column=0, sticky="e", pady=3)
+        self._version_var = tk.StringVar(value="0.0")
+        tk.Entry(f, textvariable=self._version_var, width=10).grid(
+            row=row, column=1, sticky="w", pady=3)
+        row += 1
+
+        # Stack size
+        tk.Label(f, text="Stack size:", justify="right").grid(
+            row=row, column=0, sticky="e", pady=3)
+        self._stack_var = tk.StringVar(value="4096")
+        tk.Entry(f, textvariable=self._stack_var, width=10).grid(
+            row=row, column=1, sticky="w", pady=3)
+        row += 1
+
+        # File info label
+        self._info_lbl = tk.Label(f, text="", fg="#336699", anchor="w")
+        self._info_lbl.grid(row=row, column=0, columnspan=3, sticky="w"); row += 1
+
+        f.columnconfigure(1, weight=1)
+
+        bf = tk.Frame(f)
+        bf.grid(row=row, columnspan=3, pady=(8, 0))
+        tk.Button(bf, text="Add",    width=10, command=self._ok).pack(side="left", padx=4)
+        tk.Button(bf, text="Cancel", width=10, command=self.destroy).pack(side="left", padx=4)
+
+    def _upd_dostype_preview(self, *_):
+        try:
+            dt = _parse_intval(self._dostype_var.get())
+            chars = []
+            for i in range(4):
+                b = (dt >> (24 - i * 8)) & 0xFF
+                chars.append(chr(b) if 32 <= b < 127 else f"\\{b}")
+            self._dostype_preview.config(text="".join(chars), fg="#336699")
+        except (ValueError, AttributeError):
+            self._dostype_preview.config(text="", fg="#336699")
+
+    def _browse(self):
+        path = filedialog.askopenfilename(
+            title="Select Filesystem Binary",
+            filetypes=[("All files", "*")])
+        if not path:
+            return
+        self._path_var.set(path)
+        try:
+            size = os.path.getsize(path)
+            n_lseg = math.ceil(size / LSEG_DATA)
+            self._info_lbl.config(
+                text=f"{fmt_size(size)}  ({n_lseg} LSEG block{'s' if n_lseg != 1 else ''})")
+        except OSError:
+            self._info_lbl.config(text="")
+
+    def _on_preset(self, _=None):
+        label = self._preset_var.get()
+        dt = next((v for n, v in _FS_PRESETS if n == label), 0)
+        if dt:
+            self._dostype_var.set(f"0x{dt:08X}")
+
+    def _ok(self):
+        path = self._path_var.get().strip()
+        if not path:
+            messagebox.showerror("Error", "Select a filesystem binary.", parent=self)
+            return
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as e:
+            messagebox.showerror("Error", str(e), parent=self)
+            return
+        if not data:
+            messagebox.showerror("Error", "File is empty.", parent=self)
+            return
+        try:
+            dos_type = _parse_intval(self._dostype_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Invalid DosType.", parent=self)
+            return
+        try:
+            parts = self._version_var.get().strip().split(".")
+            major = int(parts[0])
+            minor = int(parts[1]) if len(parts) > 1 else 0
+            version = (major << 16) | (minor & 0xFFFF)
+        except (ValueError, IndexError):
+            messagebox.showerror("Error", "Version must be major.minor (e.g. 47.16).",
+                                 parent=self)
+            return
+        try:
+            stack = int(self._stack_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Stack size must be an integer.", parent=self)
+            return
+
+        fs            = FilesystemInfo()
+        fs.dos_type   = dos_type
+        fs.version    = version
+        fs.stack_size = stack
+        fs.data       = data
+        self.result   = fs
         self.destroy()
 
 
@@ -934,6 +1236,9 @@ class App(tk.Tk):
         tm.add_separator()
         tm.add_command(label="Image Disk to File…", command=self._do_image_disk)
         tm.add_command(label="Restore Disk from Image…", command=self._do_restore_image)
+        tm.add_separator()
+        tm.add_command(label="Add Filesystem to RDB…",    command=self._do_add_filesystem)
+        tm.add_command(label="Remove Selected Filesystem", command=self._do_remove_filesystem)
         mb.add_cascade(label="Tools", menu=tm)
         hm = tk.Menu(mb, tearoff=0)
         hm.add_command(label="About", command=self._about)
@@ -1052,6 +1357,22 @@ class App(tk.Tk):
         self._btn_del.grid(  row=0, column=3, sticky="ew", padx=2)
         self._btn_write.grid(row=0, column=4, sticky="ew", padx=2)
 
+        # Filesystem list — packed before partition list (above it, below buttons)
+        fs_lf = ttk.LabelFrame(right, text="Filesystems")
+        fs_lf.pack(side="bottom", fill="x", padx=4, pady=2)
+
+        fscols = ("dostype", "name", "version", "size")
+        self._fstree = ttk.Treeview(fs_lf, columns=fscols, show="headings",
+                                    selectmode="browse", height=3)
+        for col, hdr, w in [("dostype","DosType",90), ("name","Name",110),
+                             ("version","Version",70), ("size","Binary",80)]:
+            self._fstree.heading(col, text=hdr)
+            self._fstree.column(col, width=w, minwidth=w, anchor="w")
+        fssb = ttk.Scrollbar(fs_lf, orient="vertical", command=self._fstree.yview)
+        self._fstree.configure(yscrollcommand=fssb.set)
+        self._fstree.pack(side="left", fill="x", expand=True, padx=(6,0), pady=4)
+        fssb.pack(side="left", fill="y", pady=4, padx=(0,4))
+
         # Partition list — packed last so expand=True only claims leftover space
         part_lf = ttk.LabelFrame(right, text="Partitions")
         part_lf.pack(fill="both", expand=True, padx=4, pady=2)
@@ -1132,6 +1453,7 @@ class App(tk.Tk):
         self._btn_edit.config(state="disabled")
         self._btn_del.config(state="disabled")
         self._refresh_parts()
+        self._refresh_filesystems()
         self._draw_map()
 
     # ── Partition list ────────────────────────────────────────────────────────
@@ -1481,12 +1803,25 @@ class App(tk.Tk):
 
         rdb = self._rdb
         n_parts = len(rdb.partitions)
+        n_fs    = len(rdb.filesystems)
 
-        # Block layout: RDSK at 0, PART at 1, 2, 3, …
-        rdsk_blk   = 0
-        part_blks  = list(range(1, 1 + n_parts))
-        rdb.rdbblock_hi  = max(15, n_parts + 1)
+        # Block layout: RDSK@0, PART@1…, FSHD+LSEG after
+        rdsk_blk  = 0
+        part_blks = list(range(1, 1 + n_parts))
+        next_blk  = 1 + n_parts
+
+        # Pre-calculate FSHD and LSEG block numbers
+        fshd_blks      = []
+        lseg_runs      = []   # list of (first_lseg_blk, n_lseg)
+        for fs in rdb.filesystems:
+            fshd_blks.append(next_blk); next_blk += 1
+            n_lseg = max(1, math.ceil(len(fs.data) / LSEG_DATA)) if fs.data else 0
+            lseg_runs.append((next_blk, n_lseg))
+            next_blk += n_lseg
+
+        rdb.rdbblock_hi   = max(15, next_blk - 1)
         rdb.part_list_blk = part_blks[0] if part_blks else END_MARK
+        rdb.fshdr_list    = fshd_blks[0] if fshd_blks else END_MARK
 
         errors = []
 
@@ -1499,19 +1834,77 @@ class App(tk.Tk):
             if not _write_block(dev, blk, build_part_block(p, rdb.heads, rdb.sectors)):
                 errors.append(f"Failed to write PART block for {p.drive_name}")
 
+        for i, (fs, fshd_blk, (first_lseg, n_lseg)) in enumerate(
+                zip(rdb.filesystems, fshd_blks, lseg_runs)):
+            next_fshd = fshd_blks[i+1] if i+1 < n_fs else END_MARK
+            first_lseg_or_end = first_lseg if n_lseg > 0 else END_MARK
+            if not _write_block(dev, fshd_blk,
+                                build_fshd_block(fs, next_fshd, first_lseg_or_end)):
+                errors.append(f"Failed to write FSHD block for {fs.label}")
+            for blk_num, blk_data in build_lseg_blocks(fs, first_lseg):
+                if not _write_block(dev, blk_num, blk_data):
+                    errors.append(f"Failed to write LSEG block {blk_num} for {fs.label}")
+
         if errors:
             messagebox.showerror("Write Errors", "\n".join(errors))
         else:
             part_info = ", ".join(str(b) for b in part_blks) or "none"
+            fs_info   = ", ".join(str(b) for b in fshd_blks) or "none"
             messagebox.showinfo("Success",
                 f"Amiga RDB written to {dev}!\n\n"
                 f"  RDSK block: {rdsk_blk}\n"
-                f"  PART block(s): {part_info}\n\n"
+                f"  PART block(s): {part_info}\n"
+                f"  FSHD block(s): {fs_info}\n\n"
                 f"Use HDInstTools or HDToolBox on the Amiga to format.")
             self._info["rdb"].config(
                 text=f"RDB written to disk ({n_parts} partition(s))",
                 foreground="#007700")
             self._status.set(f"RDB successfully written to {dev}.")
+
+    # ── Filesystem list ───────────────────────────────────────────────────────
+    def _refresh_filesystems(self):
+        for row in self._fstree.get_children():
+            self._fstree.delete(row)
+        if not self._rdb:
+            return
+        for i, fs in enumerate(self._rdb.filesystems):
+            self._fstree.insert("", "end", iid=str(i),
+                                values=(f"0x{fs.dos_type:08X}",
+                                        fs.label,
+                                        fs.version_str,
+                                        fmt_size(len(fs.data))))
+
+    def _do_add_filesystem(self):
+        if not self._rdb:
+            messagebox.showerror("No RDB", "Load or initialize an RDB first.")
+            return
+        dlg = AddFilesystemDialog(self)
+        if not dlg.result:
+            return
+        fs = dlg.result
+        # Replace if same DosType already loaded
+        self._rdb.filesystems = [x for x in self._rdb.filesystems
+                                  if x.dos_type != fs.dos_type]
+        self._rdb.filesystems.append(fs)
+        self._refresh_filesystems()
+        self._status.set(
+            f"Filesystem {fs.label} added ({fmt_size(len(fs.data))}). "
+            f"Write to disk to save.")
+
+    def _do_remove_filesystem(self):
+        sel = self._fstree.selection()
+        if not sel or not self._rdb:
+            messagebox.showinfo("No Selection", "Select a filesystem in the list first.")
+            return
+        idx = int(sel[0])
+        fs  = self._rdb.filesystems[idx]
+        if not messagebox.askyesno("Remove Filesystem",
+                f"Remove filesystem {fs.label} from the RDB?\n\n"
+                "Write to disk afterwards to make this permanent."):
+            return
+        self._rdb.filesystems.pop(idx)
+        self._refresh_filesystems()
+        self._status.set(f"Filesystem {fs.label} removed. Write to disk to save.")
 
     def _do_open_image(self):
         path = filedialog.askopenfilename(
