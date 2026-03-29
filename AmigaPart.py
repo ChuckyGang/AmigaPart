@@ -336,6 +336,11 @@ def get_disks() -> list:
         return []
 
 
+def _parse_intval(s: str) -> int:
+    s = s.strip()
+    return int(s, 16) if s.lower().startswith("0x") else int(s)
+
+
 def fmt_size(b: int) -> str:
     for unit in ("B","KB","MB","GB","TB"):
         if b < 1024:
@@ -499,6 +504,32 @@ class AddPartitionDialog(tk.Toplevel):
             self._vars[key].trace_add("write", self._upd_size)
         self._upd_size()
 
+        # ── Advanced ──────────────────────────────────────────────────────────
+        adv = ttk.LabelFrame(f, text="Advanced")
+        adv.grid(row=row, columnspan=2, sticky="ew", pady=(8, 4)); row += 1
+        adv_fields = [
+            ("Surfaces:",    str(self._rdb.heads),   "surfaces",    8),
+            ("Secs/track:",  str(self._rdb.sectors), "blkpertrk",   8),
+            ("Secs/block:",  "1",                    "secsperblk",  8),
+            ("Reserved:",    "2",                    "reserved",    8),
+            ("PreAlloc:",    "0",                    "prealloc",    8),
+            ("Interleave:",  "0",                    "interleave",  8),
+            ("NumBuffer:",   "30",                   "numbuffer",   8),
+            ("BufMemType:",  "1",                    "bufmemtype",  8),
+            ("MaxTransfer:", "0x7FFFFFFF",           "maxtransfer", 12),
+            ("Mask:",        "0xFFFFFFFE",           "mask",        12),
+            ("BootBlocks:",  "2",                    "bootblocks",  8),
+        ]
+        for i, (lbl, val, key, w) in enumerate(adv_fields):
+            c = (i % 2) * 3
+            r = i // 2
+            tk.Label(adv, text=lbl, justify="right").grid(
+                row=r, column=c, sticky="e", padx=(8, 2), pady=2)
+            v = tk.StringVar(value=val)
+            self._vars[key] = v
+            tk.Entry(adv, textvariable=v, width=w).grid(
+                row=r, column=c+1, sticky="w", padx=(0, 12), pady=2)
+
         bf = tk.Frame(f)
         bf.grid(row=row, columnspan=2, pady=(8,0))
         tk.Button(bf, text="Add",    width=10, command=self._ok).pack(side="left", padx=4)
@@ -519,9 +550,20 @@ class AddPartitionDialog(tk.Toplevel):
         if not name:
             messagebox.showerror("Error", "Drive name is required.", parent=self); return
         try:
-            lo = int(self._vars["lo"].get())
-            hi = int(self._vars["hi"].get())
-            bp = int(self._vars["bootpri"].get())
+            lo          = int(self._vars["lo"].get())
+            hi          = int(self._vars["hi"].get())
+            bp          = int(self._vars["bootpri"].get())
+            surfaces    = _parse_intval(self._vars["surfaces"].get())
+            blkpertrk   = _parse_intval(self._vars["blkpertrk"].get())
+            secsperblk  = _parse_intval(self._vars["secsperblk"].get())
+            reserved    = _parse_intval(self._vars["reserved"].get())
+            prealloc    = _parse_intval(self._vars["prealloc"].get())
+            interleave  = _parse_intval(self._vars["interleave"].get())
+            numbuffer   = _parse_intval(self._vars["numbuffer"].get())
+            bufmemtype  = _parse_intval(self._vars["bufmemtype"].get())
+            maxtransfer = _parse_intval(self._vars["maxtransfer"].get())
+            mask        = _parse_intval(self._vars["mask"].get())
+            bootblocks  = _parse_intval(self._vars["bootblocks"].get())
         except ValueError:
             messagebox.showerror("Error", "Numeric fields must be integers.", parent=self); return
         if lo < self._rdb.locyl or hi > self._rdb.hicyl or lo > hi:
@@ -543,8 +585,17 @@ class AddPartitionDialog(tk.Toplevel):
         p.dos_type     = dos_type
         p.boot_pri     = bp
         p.flags        = 0 if self._bootable_var.get() else 2
-        p.surfaces     = self._rdb.heads
-        p.blk_per_trk  = self._rdb.sectors
+        p.surfaces     = surfaces
+        p.blk_per_trk  = blkpertrk
+        p.secs_per_blk = secsperblk
+        p.reserved     = reserved
+        p.prealloc     = prealloc
+        p.interleave   = interleave
+        p.num_buffer   = numbuffer
+        p.buf_mem_type = bufmemtype
+        p.max_transfer = maxtransfer
+        p.mask         = mask
+        p.boot_blocks  = bootblocks
         self.result = p
         self.destroy()
 
@@ -635,6 +686,32 @@ class EditPartitionDialog(tk.Toplevel):
             self._vars[key].trace_add("write", self._upd_size)
         self._upd_size()
 
+        # ── Advanced ──────────────────────────────────────────────────────────
+        adv = ttk.LabelFrame(f, text="Advanced")
+        adv.grid(row=row, columnspan=2, sticky="ew", pady=(8, 4)); row += 1
+        adv_fields = [
+            ("Surfaces:",    str(p.surfaces),              "surfaces",    8),
+            ("Secs/track:",  str(p.blk_per_trk),           "blkpertrk",   8),
+            ("Secs/block:",  str(p.secs_per_blk),          "secsperblk",  8),
+            ("Reserved:",    str(p.reserved),              "reserved",    8),
+            ("PreAlloc:",    str(p.prealloc),              "prealloc",    8),
+            ("Interleave:",  str(p.interleave),            "interleave",  8),
+            ("NumBuffer:",   str(p.num_buffer),            "numbuffer",   8),
+            ("BufMemType:",  str(p.buf_mem_type),          "bufmemtype",  8),
+            ("MaxTransfer:", f"0x{p.max_transfer:08X}",   "maxtransfer", 12),
+            ("Mask:",        f"0x{p.mask:08X}",           "mask",        12),
+            ("BootBlocks:",  str(p.boot_blocks),           "bootblocks",  8),
+        ]
+        for i, (lbl, val, key, w) in enumerate(adv_fields):
+            c = (i % 2) * 3
+            r = i // 2
+            tk.Label(adv, text=lbl, justify="right").grid(
+                row=r, column=c, sticky="e", padx=(8, 2), pady=2)
+            v = tk.StringVar(value=val)
+            self._vars[key] = v
+            tk.Entry(adv, textvariable=v, width=w).grid(
+                row=r, column=c+1, sticky="w", padx=(0, 12), pady=2)
+
         bf = tk.Frame(f)
         bf.grid(row=row, columnspan=2, pady=(8, 0))
         tk.Button(bf, text="Save",   width=10, command=self._ok).pack(side="left", padx=4)
@@ -655,9 +732,20 @@ class EditPartitionDialog(tk.Toplevel):
         if not name:
             messagebox.showerror("Error", "Drive name is required.", parent=self); return
         try:
-            lo = int(self._vars["lo"].get())
-            hi = int(self._vars["hi"].get())
-            bp = int(self._vars["bootpri"].get())
+            lo          = int(self._vars["lo"].get())
+            hi          = int(self._vars["hi"].get())
+            bp          = int(self._vars["bootpri"].get())
+            surfaces    = _parse_intval(self._vars["surfaces"].get())
+            blkpertrk   = _parse_intval(self._vars["blkpertrk"].get())
+            secsperblk  = _parse_intval(self._vars["secsperblk"].get())
+            reserved    = _parse_intval(self._vars["reserved"].get())
+            prealloc    = _parse_intval(self._vars["prealloc"].get())
+            interleave  = _parse_intval(self._vars["interleave"].get())
+            numbuffer   = _parse_intval(self._vars["numbuffer"].get())
+            bufmemtype  = _parse_intval(self._vars["bufmemtype"].get())
+            maxtransfer = _parse_intval(self._vars["maxtransfer"].get())
+            mask        = _parse_intval(self._vars["mask"].get())
+            bootblocks  = _parse_intval(self._vars["bootblocks"].get())
         except ValueError:
             messagebox.showerror("Error", "Numeric fields must be integers.", parent=self); return
 
@@ -684,16 +772,17 @@ class EditPartitionDialog(tk.Toplevel):
         p.dos_type     = next(v for n, v in FS_MENU if n == self._fs_var.get())
         p.boot_pri     = bp
         p.flags        = 0 if self._bootable_var.get() else 2
-        p.surfaces     = self._orig.surfaces
-        p.blk_per_trk  = self._orig.blk_per_trk
-        p.reserved     = self._orig.reserved
-        p.prealloc     = self._orig.prealloc
-        p.interleave   = self._orig.interleave
-        p.num_buffer   = self._orig.num_buffer
-        p.buf_mem_type = self._orig.buf_mem_type
-        p.max_transfer = self._orig.max_transfer
-        p.mask         = self._orig.mask
-        p.boot_blocks  = self._orig.boot_blocks
+        p.surfaces     = surfaces
+        p.blk_per_trk  = blkpertrk
+        p.secs_per_blk = secsperblk
+        p.reserved     = reserved
+        p.prealloc     = prealloc
+        p.interleave   = interleave
+        p.num_buffer   = numbuffer
+        p.buf_mem_type = bufmemtype
+        p.max_transfer = maxtransfer
+        p.mask         = mask
+        p.boot_blocks  = bootblocks
         self.result = p
         self.destroy()
 
