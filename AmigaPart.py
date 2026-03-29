@@ -704,8 +704,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Amiga RDB Disk Partitioner")
-        self.geometry("1020x700")
-        self.minsize(800, 520)
+        self.geometry("1100x700")
+        self.minsize(900, 540)
         self._disks   = []
         self._cur_disk = None
         self._rdb: Optional[RDBInfo] = None
@@ -813,7 +813,34 @@ class App(tk.Tk):
         self._canvas.bind("<ButtonRelease-1>", self._on_map_release)
         self._canvas.bind("<Double-1>",        self._on_map_double_click)
 
-        # Partition list
+        # Status bar + buttons packed BEFORE the expanding partition list
+        # so they are always visible regardless of window height
+        self._status = tk.StringVar(value="Select a disk to begin.")
+        ttk.Label(right, textvariable=self._status, relief="sunken",
+                  anchor="w").pack(side="bottom", fill="x", padx=4, pady=(0,2))
+
+        bf = ttk.Frame(right)
+        bf.pack(side="bottom", fill="x", padx=4, pady=4)
+        for col in range(5):
+            bf.columnconfigure(col, weight=1)
+
+        self._btn_init  = ttk.Button(bf, text="Initialize RDB",  command=self._do_init,
+                                      state="disabled")
+        self._btn_add   = ttk.Button(bf, text="Add Partition",    command=self._do_add,
+                                      state="disabled")
+        self._btn_edit  = ttk.Button(bf, text="Edit Partition",   command=self._do_edit,
+                                      state="disabled")
+        self._btn_del   = ttk.Button(bf, text="Delete Partition", command=self._do_del,
+                                      state="disabled")
+        self._btn_write = ttk.Button(bf, text="✔  Write to Disk", command=self._do_write,
+                                      state="disabled")
+        self._btn_init.grid( row=0, column=0, sticky="ew", padx=2)
+        self._btn_add.grid(  row=0, column=1, sticky="ew", padx=2)
+        self._btn_edit.grid( row=0, column=2, sticky="ew", padx=2)
+        self._btn_del.grid(  row=0, column=3, sticky="ew", padx=2)
+        self._btn_write.grid(row=0, column=4, sticky="ew", padx=2)
+
+        # Partition list — packed last so expand=True only claims leftover space
         part_lf = ttk.LabelFrame(right, text="Partitions")
         part_lf.pack(fill="both", expand=True, padx=4, pady=2)
 
@@ -833,31 +860,6 @@ class App(tk.Tk):
         psb.pack(side="left", fill="y", pady=4, padx=(0,4))
         self._ptree.bind("<<TreeviewSelect>>", self._on_part_sel)
         self._ptree.bind("<Double-1>",         lambda _: self.after(0, self._do_edit))
-
-        # Action buttons
-        bf = ttk.Frame(right)
-        bf.pack(fill="x", padx=4, pady=4)
-
-        self._btn_init  = ttk.Button(bf, text="Initialize RDB",  command=self._do_init,
-                                      state="disabled")
-        self._btn_add   = ttk.Button(bf, text="Add Partition",    command=self._do_add,
-                                      state="disabled")
-        self._btn_edit  = ttk.Button(bf, text="Edit Partition",   command=self._do_edit,
-                                      state="disabled")
-        self._btn_del   = ttk.Button(bf, text="Delete Partition", command=self._do_del,
-                                      state="disabled")
-        self._btn_write = ttk.Button(bf, text="✔  Write to Disk", command=self._do_write,
-                                      state="disabled")
-        self._btn_init.pack(side="left", padx=2)
-        self._btn_add.pack(side="left",  padx=2)
-        self._btn_edit.pack(side="left", padx=2)
-        self._btn_del.pack(side="left",  padx=2)
-        self._btn_write.pack(side="right", padx=2)
-
-        # Status bar
-        self._status = tk.StringVar(value="Select a disk to begin.")
-        ttk.Label(right, textvariable=self._status, relief="sunken",
-                  anchor="w").pack(fill="x", padx=4, pady=(0,2))
 
     # ── Disk list ─────────────────────────────────────────────────────────────
     def _refresh_disks(self):
