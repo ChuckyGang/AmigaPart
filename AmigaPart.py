@@ -1031,6 +1031,9 @@ class App(tk.Tk):
 
     # ── Partition list ────────────────────────────────────────────────────────
     def _refresh_parts(self):
+        if self._rdb:
+            self._rdb.partitions.sort(key=lambda p: p.low_cyl)
+
         # Remember current selection index so we can restore it
         cur = self._ptree.selection()
         prev_idx = int(cur[0]) if cur else None
