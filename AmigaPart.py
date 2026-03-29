@@ -549,6 +549,155 @@ class AddPartitionDialog(tk.Toplevel):
         self.destroy()
 
 
+# ─── Edit partition dialog ─────────────────────────────────────────────────────
+
+class EditPartitionDialog(tk.Toplevel):
+    def __init__(self, parent, rdb: RDBInfo, part_idx: int):
+        super().__init__(parent)
+        self.transient(parent)
+        self.title("Edit Partition")
+        self.resizable(False, False)
+        self.result: Optional[PartitionInfo] = None
+        self._rdb      = rdb
+        self._idx      = part_idx
+        self._orig     = rdb.partitions[part_idx]
+        self._min_lo, self._max_hi = self._calc_window()
+        self._build()
+        self.update_idletasks()
+        pw = parent.winfo_width();  ph = parent.winfo_height()
+        px = parent.winfo_rootx(); py = parent.winfo_rooty()
+        dw = self.winfo_reqwidth(); dh = self.winfo_reqheight()
+        self.geometry(f"+{px + (pw - dw)//2}+{py + (ph - dh)//2}")
+        self.wait_visibility()
+        self.grab_set()
+        self.wait_window()
+
+    def _calc_window(self) -> tuple:
+        """Return (min_lo, max_hi) — the cylinder range this partition can expand into."""
+        others = [p for i, p in enumerate(self._rdb.partitions) if i != self._idx]
+        others_sorted = sorted(others, key=lambda p: p.low_cyl)
+        min_lo = self._rdb.locyl
+        max_hi = self._rdb.hicyl
+        for p in others_sorted:
+            if p.high_cyl < self._orig.low_cyl:
+                min_lo = max(min_lo, p.high_cyl + 1)
+            if p.low_cyl > self._orig.high_cyl:
+                max_hi = min(max_hi, p.low_cyl - 1)
+        return min_lo, max_hi
+
+    def _build(self):
+        f = tk.Frame(self, padx=12, pady=10)
+        f.pack(fill="both", expand=True)
+        row = 0
+
+        p = self._orig
+        cyls = p.high_cyl - p.low_cyl + 1
+        sz = fmt_size(cyls * self._rdb.heads * self._rdb.sectors * 512)
+        tk.Label(f, text=f"Partition:  {p.drive_name}  ({sz})",
+                 font=("", 10, "bold")).grid(row=row, columnspan=2, sticky="w"); row += 1
+        tk.Label(f, text=f"Cylinder window: {self._min_lo}–{self._max_hi}",
+                 fg="gray", font=("", 8)).grid(row=row, columnspan=2, sticky="w"); row += 1
+
+        def lbl_entry(label, val, key, width=12):
+            nonlocal row
+            tk.Label(f, text=label, justify="right").grid(
+                row=row, column=0, sticky="e", pady=3)
+            v = tk.StringVar(value=val)
+            self._vars[key] = v
+            tk.Entry(f, textvariable=v, width=width).grid(
+                row=row, column=1, sticky="w", pady=3)
+            row += 1
+
+        self._vars = {}
+        lbl_entry("Drive name:",    p.drive_name,    "name", 10)
+        lbl_entry("Low cylinder:",  str(p.low_cyl),  "lo",   10)
+        lbl_entry("High cylinder:", str(p.high_cyl), "hi",   10)
+
+        tk.Label(f, text="Filesystem:").grid(row=row, column=0, sticky="e", pady=3)
+        self._fs_var = tk.StringVar(
+            value=next((n for n, v in FS_MENU if v == p.dos_type), FS_MENU[0][0]))
+        ttk.Combobox(f, textvariable=self._fs_var,
+                     values=[x[0] for x in FS_MENU],
+                     state="readonly", width=30).grid(row=row, column=1, sticky="w", pady=3)
+        row += 1
+
+        lbl_entry("Boot priority:", str(p.boot_pri), "bootpri", 6)
+
+        self._bootable_var = tk.BooleanVar(value=(p.flags == 0))
+        tk.Checkbutton(f, text="Bootable",
+                       variable=self._bootable_var).grid(row=row, columnspan=2, sticky="w")
+        row += 1
+
+        self._size_lbl = tk.Label(f, text="", fg="#336699")
+        self._size_lbl.grid(row=row, columnspan=2, sticky="w"); row += 1
+
+        for key in ("lo", "hi"):
+            self._vars[key].trace_add("write", self._upd_size)
+        self._upd_size()
+
+        bf = tk.Frame(f)
+        bf.grid(row=row, columnspan=2, pady=(8, 0))
+        tk.Button(bf, text="Save",   width=10, command=self._ok).pack(side="left", padx=4)
+        tk.Button(bf, text="Cancel", width=10, command=self.destroy).pack(side="left", padx=4)
+
+    def _upd_size(self, *_):
+        try:
+            lo = int(self._vars["lo"].get())
+            hi = int(self._vars["hi"].get())
+            cyls = hi - lo + 1
+            sz = cyls * self._rdb.heads * self._rdb.sectors * 512
+            self._size_lbl.config(text=f"Size: {fmt_size(sz)}  ({cyls} cylinders)")
+        except ValueError:
+            self._size_lbl.config(text="")
+
+    def _ok(self):
+        name = self._vars["name"].get().strip()
+        if not name:
+            messagebox.showerror("Error", "Drive name is required.", parent=self); return
+        try:
+            lo = int(self._vars["lo"].get())
+            hi = int(self._vars["hi"].get())
+            bp = int(self._vars["bootpri"].get())
+        except ValueError:
+            messagebox.showerror("Error", "Numeric fields must be integers.", parent=self); return
+
+        if lo < self._min_lo or hi > self._max_hi or lo > hi:
+            messagebox.showerror("Error",
+                f"Cylinder range must be within {self._min_lo}–{self._max_hi} "
+                f"and low ≤ high.", parent=self); return
+
+        # Warn if cylinder range changed (data loss risk)
+        resized = (lo != self._orig.low_cyl or hi != self._orig.high_cyl)
+        if resized:
+            if not messagebox.askyesno("Data Loss Warning",
+                    f"You changed the cylinder range from "
+                    f"{self._orig.low_cyl}–{self._orig.high_cyl} to {lo}–{hi}.\n\n"
+                    "Resizing a partition WILL corrupt or lose the data on it.\n\n"
+                    "Continue?", icon="warning", parent=self):
+                return
+
+        p = PartitionInfo()
+        p.block_num    = self._orig.block_num
+        p.drive_name   = name
+        p.low_cyl      = lo
+        p.high_cyl     = hi
+        p.dos_type     = next(v for n, v in FS_MENU if n == self._fs_var.get())
+        p.boot_pri     = bp
+        p.flags        = 0 if self._bootable_var.get() else 2
+        p.surfaces     = self._orig.surfaces
+        p.blk_per_trk  = self._orig.blk_per_trk
+        p.reserved     = self._orig.reserved
+        p.prealloc     = self._orig.prealloc
+        p.interleave   = self._orig.interleave
+        p.num_buffer   = self._orig.num_buffer
+        p.buf_mem_type = self._orig.buf_mem_type
+        p.max_transfer = self._orig.max_transfer
+        p.mask         = self._orig.mask
+        p.boot_blocks  = self._orig.boot_blocks
+        self.result = p
+        self.destroy()
+
+
 # ─── Main window ───────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
@@ -584,6 +733,9 @@ class App(tk.Tk):
         style = ttk.Style(self)
         style.configure("Treeview", rowheight=34)
         style.configure("Treeview.Heading", font=("", 9, "bold"))
+        style.map("Treeview",
+                  background=[("selected", "#1a6aad")],
+                  foreground=[("selected", "white")])
 
         pw = ttk.PanedWindow(self, orient="horizontal")
         pw.pack(fill="both", expand=True, padx=4, pady=4)
@@ -659,6 +811,7 @@ class App(tk.Tk):
         self._canvas.bind("<Button-1>",        self._on_map_press)
         self._canvas.bind("<B1-Motion>",       self._on_map_drag)
         self._canvas.bind("<ButtonRelease-1>", self._on_map_release)
+        self._canvas.bind("<Double-1>",        self._on_map_double_click)
 
         # Partition list
         part_lf = ttk.LabelFrame(right, text="Partitions")
@@ -679,21 +832,25 @@ class App(tk.Tk):
         self._ptree.pack(side="left", fill="both", expand=True, padx=(6,0), pady=4)
         psb.pack(side="left", fill="y", pady=4, padx=(0,4))
         self._ptree.bind("<<TreeviewSelect>>", self._on_part_sel)
+        self._ptree.bind("<Double-1>",         lambda _: self.after(0, self._do_edit))
 
         # Action buttons
         bf = ttk.Frame(right)
         bf.pack(fill="x", padx=4, pady=4)
 
-        self._btn_init  = ttk.Button(bf, text="Initialize RDB", command=self._do_init,
+        self._btn_init  = ttk.Button(bf, text="Initialize RDB",  command=self._do_init,
                                       state="disabled")
-        self._btn_add   = ttk.Button(bf, text="Add Partition",   command=self._do_add,
+        self._btn_add   = ttk.Button(bf, text="Add Partition",    command=self._do_add,
                                       state="disabled")
-        self._btn_del   = ttk.Button(bf, text="Delete Partition",command=self._do_del,
+        self._btn_edit  = ttk.Button(bf, text="Edit Partition",   command=self._do_edit,
+                                      state="disabled")
+        self._btn_del   = ttk.Button(bf, text="Delete Partition", command=self._do_del,
                                       state="disabled")
         self._btn_write = ttk.Button(bf, text="✔  Write to Disk", command=self._do_write,
                                       state="disabled")
         self._btn_init.pack(side="left", padx=2)
         self._btn_add.pack(side="left",  padx=2)
+        self._btn_edit.pack(side="left", padx=2)
         self._btn_del.pack(side="left",  padx=2)
         self._btn_write.pack(side="right", padx=2)
 
@@ -749,6 +906,7 @@ class App(tk.Tk):
             self._btn_write.config(state="disabled")
             self._status.set(f"{dev}: No RDB — use 'Initialize RDB' first.")
 
+        self._btn_edit.config(state="disabled")
         self._btn_del.config(state="disabled")
         self._refresh_parts()
         self._draw_map()
@@ -786,8 +944,10 @@ class App(tk.Tk):
         self._on_part_sel()
 
     def _on_part_sel(self, _=None):
-        self._btn_del.config(
-            state="normal" if self._ptree.selection() else "disabled")
+        has_sel = bool(self._ptree.selection())
+        self._btn_edit.config(state="normal" if has_sel else "disabled")
+        self._btn_del.config(state="normal"  if has_sel else "disabled")
+        self._draw_map()
 
     # ── Disk map ──────────────────────────────────────────────────────────────
     def _draw_map(self):
@@ -843,6 +1003,23 @@ class App(tk.Tk):
                 c.create_text((px1+px2)/2, (y1+y2)/2,
                               text=label, fill="white",
                               font=("",8,"bold"))
+
+        # Highlight selected partition
+        sel = self._ptree.selection()
+        if sel:
+            sel_idx = int(sel[0])
+            if 0 <= sel_idx < len(self._rdb.partitions):
+                sp = self._rdb.partitions[sel_idx]
+                sx1 = x_of(sp.low_cyl)
+                sx2 = x_of(sp.high_cyl + 1)
+                if sx2 < sx1 + 2:
+                    sx2 = sx1 + 2
+                # Outer glow
+                c.create_rectangle(sx1 - 2, y1 - 2, sx2 + 2, y2 + 2,
+                                    fill="", outline="#ffffff", width=1)
+                # Inner bright border
+                c.create_rectangle(sx1, y1, sx2, y2,
+                                    fill="", outline="white", width=3)
 
         # Ghost partition (drag-to-create)
         if self._drag is not None:
@@ -944,6 +1121,21 @@ class App(tk.Tk):
         self._status.set(f"New partition: cyls {lo}–{hi}  ({cyls} cylinder{'s' if cyls != 1 else ''}, {fmt_size(sz)})")
         self._draw_map()
 
+    def _on_map_double_click(self, event):
+        if not self._rdb:
+            return
+        H = self._canvas.winfo_height()
+        if not (6 <= event.y <= H - 18):
+            return
+        cyl = self._map_x_to_cyl(event.x)
+        for i, p in enumerate(self._rdb.partitions):
+            if p.low_cyl <= cyl <= p.high_cyl:
+                self._ptree.selection_set(str(i))
+                self._ptree.focus(str(i))
+                self._ptree.see(str(i))
+                self._do_edit()
+                return
+
     def _on_map_release(self, event):
         if self._drag is None:
             return
@@ -1001,6 +1193,19 @@ class App(tk.Tk):
         self._status.set(
             f"Partition '{dlg.result.drive_name}' added. Write to disk to save changes.")
 
+    def _do_edit(self):
+        sel = self._ptree.selection()
+        if not sel or not self._rdb:
+            return
+        idx = int(sel[0])
+        dlg = EditPartitionDialog(self, self._rdb, idx)
+        if dlg.result:
+            self._rdb.partitions[idx] = dlg.result
+            self._refresh_parts()
+            self._draw_map()
+            self._status.set(
+                f"Partition '{dlg.result.drive_name}' updated. Write to disk to save changes.")
+
     def _do_del(self):
         sel = self._ptree.selection()
         if not sel or not self._rdb:
@@ -1012,6 +1217,7 @@ class App(tk.Tk):
                 "Write to disk afterwards to make this permanent."):
             return
         self._rdb.partitions.pop(idx)
+        self._btn_edit.config(state="disabled")
         self._btn_del.config(state="disabled")
         self._refresh_parts()
         self._draw_map()
