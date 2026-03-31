@@ -174,6 +174,14 @@ def _read_block(dev: str, block: int) -> Optional[bytes]:
         return None
 
 
+def _has_pc_partitioning(dev: str) -> bool:
+    """Return True if the disk has a PC-style MBR signature (0x55AA at offset 510)."""
+    data = _read_block(dev, 0)
+    if data is None or len(data) < 512:
+        return False
+    return data[510] == 0x55 and data[511] == 0xAA
+
+
 def _write_block(dev: str, block: int, data: bytes) -> bool:
     try:
         with open(dev, "r+b") as f:
@@ -1800,6 +1808,15 @@ class App(tk.Tk):
         self.update_idletasks()
 
         self._rdb = read_rdb(dev)
+
+        if _has_pc_partitioning(dev):
+            messagebox.showwarning(
+                "PC Partitioning Detected",
+                f"{dev} contains a PC-style (MBR) partition table.\n\n"
+                "Writing an Amiga RDB to this disk will DESTROY all existing "
+                "partitions and data on it.\n\n"
+                "Make sure you have a backup before proceeding.")
+
         self._info["device"].config(text=dev, foreground="black")
         self._info["model"].config(text=self._cur_disk["model"] or "Unknown", foreground="black")
         self._info["size"].config(text=fmt_size(self._cur_disk["size"]), foreground="black")
