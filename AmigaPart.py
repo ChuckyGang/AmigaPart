@@ -194,6 +194,757 @@ def _write_block(dev: str, block: int, data: bytes) -> bool:
         return False
 
 
+# ─── Partition Move / Grow ─────────────────────────────────────────────────────
+
+_MOVE_CHUNK = 128   # sectors per read/write pass (64 KB)
+
+# ── SFS helpers ────────────────────────────────────────────────────────────────
+
+def _sfs_is_type(dos_type: int) -> bool:
+    return (dos_type & 0xFFFFFF00) == 0x53465300
+
+def _sfs_verify_chk(data: bytes, block_size: int) -> bool:
+    """SFS CALCCHECKSUM: acc=1 + sum all ULONGs; block is valid when result == 0."""
+    acc = 1
+    for i in range(0, block_size, 4):
+        acc = (acc + struct.unpack_from(">I", data, i)[0]) & 0xFFFFFFFF
+    return acc == 0
+
+def _sfs_fix_chk(buf: bytearray, block_size: int):
+    """Set SFS checksum (byte offset 4) so the block passes _sfs_verify_chk."""
+    struct.pack_into(">I", buf, 4, 0)
+    acc = 1
+    for i in range(0, block_size, 4):
+        acc = (acc + struct.unpack_from(">I", buf, i)[0]) & 0xFFFFFFFF
+    struct.pack_into(">I", buf, 4, (-acc) & 0xFFFFFFFF)
+
+# ── FFS helpers ────────────────────────────────────────────────────────────────
+
+def _ffs_is_type(dos_type: int) -> bool:
+    return (dos_type & 0xFFFFFF00) == 0x444F5300 and (dos_type & 0xFF) <= 7
+
+def _ffs_checksum(buf: bytes, nlongs: int) -> int:
+    """FFS block checksum value: -(sum of all longs) & 0xFFFFFFFF."""
+    s = 0
+    for i in range(nlongs):
+        s = (s + struct.unpack_from(">I", buf, i * 4)[0]) & 0xFFFFFFFF
+    return (-s) & 0xFFFFFFFF
+
+def _bm_setfree(buf: bytearray, off: int):
+    """Mark FFS bitmap bit 'off' as free (1)."""
+    idx = (1 + off // 32) * 4
+    v = struct.unpack_from(">I", buf, idx)[0]
+    struct.pack_into(">I", buf, idx, v | (1 << (31 - off % 32)))
+
+def _bm_setused(buf: bytearray, off: int):
+    """Mark FFS bitmap bit 'off' as used (0)."""
+    idx = (1 + off // 32) * 4
+    v = struct.unpack_from(">I", buf, idx)[0]
+    struct.pack_into(">I", buf, idx, v & ~(1 << (31 - off % 32)) & 0xFFFFFFFF)
+
+# ── PFS helpers ────────────────────────────────────────────────────────────────
+
+def _pfs_is_type(dos_type: int) -> bool:
+    prefix = dos_type >> 8
+    ver    = dos_type & 0xFF
+    return prefix in (0x504653, 0x504453) and ver <= 3
+
+# ── Move validation ─────────────────────────────────────────────────────────────
+
+def _part_can_move(rdb, pi, new_lo: int):
+    """Returns (True, new_hi) or (False, err_str)."""
+    if pi.high_cyl < pi.low_cyl:
+        return False, f"Invalid cylinder range ({pi.low_cyl}–{pi.high_cyl})."
+    cyl_count = pi.high_cyl - pi.low_cyl + 1
+    new_hi    = new_lo + cyl_count - 1
+    if new_lo == pi.low_cyl:
+        return False, f"Partition is already at cylinder {new_lo}."
+    if new_lo < rdb.locyl:
+        return False, f"Start cylinder {new_lo} is below the first usable cylinder ({rdb.locyl})."
+    if new_hi > rdb.hicyl:
+        return False, f"End cylinder {new_hi} exceeds the disk limit ({rdb.hicyl})."
+    for other in rdb.partitions:
+        if other is pi:
+            continue
+        if new_lo <= other.high_cyl and new_hi >= other.low_cyl:
+            return False, (f"New position (cyl {new_lo}–{new_hi}) overlaps "
+                           f"partition {other.drive_name} (cyl {other.low_cyl}–{other.high_cyl}).")
+    return True, new_hi
+
+# ── Move data ──────────────────────────────────────────────────────────────────
+
+_DD_CHUNK = 2048   # sectors per dd invocation (~1 MB)
+
+def _part_move_data(dev: str, rdb, pi, new_lo: int,
+                    progress_cb=None, use_dd: bool = False) -> tuple:
+    """Copy all partition blocks from pi's current location to new_lo.
+    Returns (True, msg) or (False, err_str).
+    Direction-safe: front-to-back when moving lower, back-to-front when moving higher.
+    SFS firstbyte/lastbyte metadata is updated in both root copies after the copy.
+    Does NOT update pi or write the RDB — caller must do that on success."""
+
+    heads    = pi.surfaces    or rdb.heads
+    sectors  = pi.blk_per_trk or rdb.sectors
+    if not heads or not sectors:
+        return False, f"Invalid geometry (heads={heads}, sectors={sectors})."
+
+    cyl_count  = pi.high_cyl - pi.low_cyl + 1
+    new_hi     = new_lo + cyl_count - 1
+    phys_old   = pi.low_cyl * heads * sectors
+    phys_new   = new_lo     * heads * sectors
+    phys_total = cyl_count  * heads * sectors
+
+    def prog(done, total, phase):
+        if progress_cb:
+            progress_cb(done, total, phase)
+
+    prog(0, phys_total, "Copying blocks...")
+    done = 0
+
+    if use_dd:
+        # Overlapping-higher: source and destination overlap AND dest > src.
+        # Must copy back-to-front. All other cases: single dd is safe.
+        overlapping_higher = (phys_new > phys_old) and (phys_new < phys_old + phys_total)
+
+        # Use byte-based skip/seek/count (GNU dd iflag/oflag) so dd can use
+        # large 1 MB blocks internally regardless of sector size.
+        def dd_copy(src_sec, dst_sec, sec_count):
+            subprocess.run(
+                ["dd", f"if={dev}", f"of={dev}", "bs=1M",
+                 f"skip={src_sec * 512}", f"seek={dst_sec * 512}",
+                 f"count={sec_count * 512}",
+                 "iflag=skip_bytes,count_bytes", "oflag=seek_bytes",
+                 "conv=notrunc"],
+                check=True, capture_output=True)
+
+        if not overlapping_higher:
+            # One dd call for the whole partition — fastest path.
+            prog(0, phys_total, "Copying blocks (dd)...")
+            try:
+                dd_copy(phys_old, phys_new, phys_total)
+            except subprocess.CalledProcessError as e:
+                return False, ("dd failed: "
+                               f"{e.stderr.decode(errors='replace').strip()}")
+            prog(phys_total, phys_total, "Copying blocks (dd)...")
+        else:
+            # Overlapping higher: reverse with 128 MB chunks.
+            chunk_sz = 262144  # 128 MB in 512-byte sectors
+            i = phys_total
+            while i > 0:
+                cnt = min(chunk_sz, i)
+                i  -= cnt
+                try:
+                    dd_copy(phys_old + i, phys_new + i, cnt)
+                except subprocess.CalledProcessError as e:
+                    return False, (f"dd error at block {phys_old + i}: "
+                                   f"{e.stderr.decode(errors='replace').strip()}")
+                done += cnt
+                prog(done, phys_total, "Copying blocks (dd)...")
+    else:
+        def read_secs(start, count):
+            try:
+                with open(dev, "rb") as f:
+                    f.seek(start * 512)
+                    data = f.read(count * 512)
+                return data if len(data) == count * 512 else None
+            except OSError:
+                return None
+
+        def write_secs(start, data):
+            try:
+                with open(dev, "r+b") as f:
+                    f.seek(start * 512)
+                    f.write(data)
+                    f.flush()
+                    os.fsync(f.fileno())
+                return True
+            except OSError:
+                return False
+
+        if phys_new < phys_old:
+            # Moving to lower address: copy front-to-back (destination precedes source)
+            i = 0
+            while i < phys_total:
+                chunk = min(_MOVE_CHUNK, phys_total - i)
+                buf = read_secs(phys_old + i, chunk)
+                if buf is None:
+                    return False, f"Read error at block {phys_old + i} (after {done} blocks copied)."
+                if not write_secs(phys_new + i, buf):
+                    return False, f"Write error at block {phys_new + i} (after {done} blocks copied)."
+                done += chunk
+                i += chunk
+                prog(done, phys_total, "Copying blocks...")
+        else:
+            # Moving to higher address: copy back-to-front (destination follows source)
+            i = phys_total
+            while i > 0:
+                chunk = min(_MOVE_CHUNK, i)
+                i -= chunk
+                buf = read_secs(phys_old + i, chunk)
+                if buf is None:
+                    return False, f"Read error at block {phys_old + i} (after {done} blocks copied)."
+                if not write_secs(phys_new + i, buf):
+                    return False, f"Write error at block {phys_new + i} (after {done} blocks copied)."
+                done += chunk
+                prog(done, phys_total, "Copying blocks...")
+
+    prog(phys_total, phys_total, "Copying blocks...")
+
+    ok, sfs_msg = _sfs_fixup_after_move(dev, rdb, pi, new_lo)
+    if not ok:
+        return False, sfs_msg
+
+    msg = (f"Moved {cyl_count} cylinders of data.\n"
+           f"cyl {pi.low_cyl}–{pi.high_cyl}  →  {new_lo}–{new_hi}\n"
+           f"phys blocks: {phys_old} → {phys_new} ({phys_total} blocks)")
+    return True, msg
+
+
+def _sfs_fixup_after_move(dev: str, rdb, pi, new_lo: int) -> tuple:
+    """Update SFS firstbyte/lastbyte in both root copies after a partition move.
+    Returns (True, "") on success or if not an SFS partition, (False, err) on failure."""
+    if not _sfs_is_type(pi.dos_type):
+        return True, ""
+
+    _SFS_ROOT_ID    = 0x53465300
+    _OFF_BLOCKSIZE  = 52
+    _OFF_FIRSTBYTEH = 32
+    _OFF_FIRSTBYTE  = 36
+    _OFF_LASTBYTEH  = 40
+    _OFF_LASTBYTE   = 44
+    _OFF_TOTALBLKS  = 48
+
+    heads    = pi.surfaces    or rdb.heads
+    sectors  = pi.blk_per_trk or rdb.sectors
+    phys_new = new_lo * heads * sectors
+
+    scratch = _read_block(dev, phys_new)
+    if scratch is None:
+        return False, "SFS: cannot read new root block 0."
+    if struct.unpack_from(">I", scratch, 0)[0] != _SFS_ROOT_ID:
+        return False, ("SFS: root ID mismatch after copy — "
+                       "metadata not updated.  Run SFScheck after reboot.")
+    sfs_bs = struct.unpack_from(">I", scratch, _OFF_BLOCKSIZE)[0]
+    if sfs_bs < 512 or (sfs_bs & (sfs_bs - 1)) or sfs_bs % 512:
+        return False, f"SFS: invalid blocksize {sfs_bs}."
+    sfs_phys = sfs_bs // 512
+
+    def read_sfs_rb(sfs_blk):
+        out = bytearray()
+        base = phys_new + sfs_blk * sfs_phys
+        for k in range(sfs_phys):
+            b = _read_block(dev, base + k)
+            if b is None:
+                return None
+            out.extend(b)
+        return out
+
+    def write_sfs_rb(sfs_blk, buf):
+        base = phys_new + sfs_blk * sfs_phys
+        for k in range(sfs_phys):
+            if not _write_block(dev, base + k, bytes(buf[k * 512:(k + 1) * 512])):
+                return False
+        return True
+
+    rb0 = read_sfs_rb(0)
+    if rb0 is None or not _sfs_verify_chk(bytes(rb0), sfs_bs):
+        return False, "SFS: root block 0 read/checksum error after copy."
+
+    totalblks = struct.unpack_from(">I", rb0, _OFF_TOTALBLKS)[0]
+    old_fb = ((struct.unpack_from(">I", rb0, _OFF_FIRSTBYTEH)[0] << 32) |
+               struct.unpack_from(">I", rb0, _OFF_FIRSTBYTE)[0])
+    old_lb = ((struct.unpack_from(">I", rb0, _OFF_LASTBYTEH)[0] << 32) |
+               struct.unpack_from(">I", rb0, _OFF_LASTBYTE)[0])
+    new_fb = phys_new * 512
+    new_lb = new_fb + (old_lb - old_fb)
+
+    for sfs_blk in (0, totalblks - 1):
+        rb = read_sfs_rb(sfs_blk)
+        if rb is None:
+            continue
+        if not _sfs_verify_chk(bytes(rb), sfs_bs):
+            continue
+        if struct.unpack_from(">I", rb, 0)[0] != _SFS_ROOT_ID:
+            continue
+        struct.pack_into(">I", rb, _OFF_FIRSTBYTEH, (new_fb >> 32) & 0xFFFFFFFF)
+        struct.pack_into(">I", rb, _OFF_FIRSTBYTE,   new_fb         & 0xFFFFFFFF)
+        struct.pack_into(">I", rb, _OFF_LASTBYTEH,  (new_lb >> 32) & 0xFFFFFFFF)
+        struct.pack_into(">I", rb, _OFF_LASTBYTE,    new_lb         & 0xFFFFFFFF)
+        _sfs_fix_chk(rb, sfs_bs)
+        if not write_sfs_rb(sfs_blk, rb) and sfs_blk == 0:
+            return False, ("SFS: failed to write primary root block after move.\n"
+                           "Data was copied but location metadata not updated.\n"
+                           "Run SFScheck after reboot.")
+    return True, ""
+
+# ── Grow validation ─────────────────────────────────────────────────────────────
+
+def _part_can_grow(rdb, pi, new_hi: int):
+    """Returns (True,) or (False, err_str)."""
+    if new_hi <= pi.high_cyl:
+        return False, f"New high cylinder {new_hi} must be greater than current ({pi.high_cyl})."
+    if new_hi > rdb.hicyl:
+        return False, f"New high cylinder {new_hi} exceeds the disk limit ({rdb.hicyl})."
+    for other in rdb.partitions:
+        if other is pi:
+            continue
+        if pi.low_cyl <= other.high_cyl and new_hi >= other.low_cyl:
+            return False, (f"Extended range (cyl {pi.low_cyl}–{new_hi}) overlaps "
+                           f"partition {other.drive_name} "
+                           f"(cyl {other.low_cyl}–{other.high_cyl}).")
+    return (True,)
+
+# ── FFS filesystem grow ─────────────────────────────────────────────────────────
+
+_FFS_ROOT_BM_MAX   = 25
+_FFS_EXT_BM_MAX    = 127
+_FFS_MAX_EXT_CHAIN = 32
+_FFS_RL_CHKSUM     = 5
+_FFS_RL_BM_FLAG    = 78
+_FFS_RL_BM_PAGES   = 79   # root_buf[79..103] = 25 bitmap block pointers
+_FFS_RL_BM_EXT     = 104
+_FFS_T_SHORT       = 2
+_FFS_ST_ROOT       = 1
+_FFS_BM_VALID      = 0xFFFFFFFF
+
+
+def _ffs_grow(dev: str, rdb, pi, old_hi: int, progress_cb=None) -> tuple:
+    """Grow an FFS/OFS filesystem to match pi.high_cyl (already updated).
+    Ports DiskPart ffsresize.c algorithm faithfully.
+    Returns (True, msg) or (False, err_str)."""
+
+    heads   = pi.surfaces    or rdb.heads
+    sectors = pi.blk_per_trk or rdb.sectors
+    nlongs  = 128   # 512 bytes / 4
+    eff_bsz = 512
+
+    if not heads or not sectors:
+        return False, f"Invalid geometry (heads={heads}, sectors={sectors})."
+
+    part_abs   = pi.low_cyl  * heads * sectors
+    old_blocks = (old_hi      - pi.low_cyl + 1) * heads * sectors
+    new_blocks = (pi.high_cyl - pi.low_cyl + 1) * heads * sectors
+    reserved   = pi.reserved if pi.reserved > 0 else 2
+    bpbm       = (nlongs - 1) * 32   # 127 * 32 = 4064 blocks per bitmap block
+
+    def prog(msg):
+        if progress_cb:
+            progress_cb(msg)
+
+    def read_blk(abs_blk):
+        d = _read_block(dev, abs_blk)
+        return bytearray(d) if d else None
+
+    def write_blk(abs_blk, buf):
+        return _write_block(dev, abs_blk, bytes(buf) if isinstance(buf, bytearray) else buf)
+
+    if old_blocks <= reserved or new_blocks <= reserved:
+        return False, (f"Partition too small (old_blocks={old_blocks}, "
+                       f"new_blocks={new_blocks}, reserved={reserved}).")
+
+    # FFS BitmapCount formula (from init.asm):
+    # BitmapCount = (bpbm - 2 + HighestBlock - reserved) / bpbm
+    old_bm_need = (bpbm - 2 + old_blocks - reserved) // bpbm
+    new_bm_need = (bpbm - 2 + new_blocks - reserved) // bpbm
+    num_new_bm  = new_bm_need - old_bm_need
+
+    # Phase 1: read + validate boot block
+    prog("Reading boot block...")
+    boot_buf = read_blk(part_abs)
+    if not boot_buf:
+        return False, f"Cannot read boot block (abs {part_abs})."
+    if (struct.unpack_from(">I", boot_buf, 0)[0] & 0xFFFFFF00) != 0x444F5300:
+        return False, "Boot block DosType mismatch."
+    root_blk_stored = struct.unpack_from(">I", boot_buf, 8)[0]   # L[2] = bb[2]
+    root_blk = root_blk_stored
+    if root_blk == 0 or root_blk >= old_blocks:
+        root_blk = old_blocks // 2
+
+    # Phase 2: read + validate root block
+    prog("Reading root block...")
+    root_buf = read_blk(part_abs + root_blk)
+    if not root_buf:
+        return False, f"Cannot read root block (abs {part_abs + root_blk}, rel {root_blk})."
+    if (struct.unpack_from(">I", root_buf, 0)[0] != _FFS_T_SHORT or
+            struct.unpack_from(">I", root_buf, (nlongs - 1) * 4)[0] != _FFS_ST_ROOT):
+        return False, (f"Root block wrong type/sec_type "
+                       f"({struct.unpack_from('>I', root_buf, 0)[0]:#010x}/"
+                       f"{struct.unpack_from('>I', root_buf, (nlongs-1)*4)[0]:#010x}).")
+    save_cs = struct.unpack_from(">I", root_buf, _FFS_RL_CHKSUM * 4)[0]
+    struct.pack_into(">I", root_buf, _FFS_RL_CHKSUM * 4, 0)
+    calc_cs = _ffs_checksum(bytes(root_buf), nlongs)
+    struct.pack_into(">I", root_buf, _FFS_RL_CHKSUM * 4, save_cs)
+    if calc_cs != save_cs:
+        return False, f"Root block checksum invalid (stored {save_cs:#010x}, calc {calc_cs:#010x})."
+    if struct.unpack_from(">I", root_buf, _FFS_RL_BM_FLAG * 4)[0] != _FFS_BM_VALID:
+        return False, "Bitmap not valid in root block (filesystem may need DiskSalv)."
+
+    # Phase 3: collect existing bitmap block numbers from root + ext chain
+    prog("Reading bitmap chain...")
+    bm_blknums = []
+    ext_chain  = []   # list of (relblk, used_count)
+
+    for i in range(_FFS_ROOT_BM_MAX):
+        v = struct.unpack_from(">I", root_buf, (_FFS_RL_BM_PAGES + i) * 4)[0]
+        if v == 0:
+            break
+        bm_blknums.append(v)
+
+    ext_blk = struct.unpack_from(">I", root_buf, _FFS_RL_BM_EXT * 4)[0]
+    while ext_blk != 0 and len(ext_chain) < _FFS_MAX_EXT_CHAIN:
+        eb = read_blk(part_abs + ext_blk)
+        if not eb:
+            break
+        used = 0
+        for i in range(_FFS_EXT_BM_MAX):
+            v = struct.unpack_from(">I", eb, i * 4)[0]
+            if v == 0:
+                break
+            used += 1
+            bm_blknums.append(v)
+        ext_chain.append((ext_blk, used))
+        ext_blk = struct.unpack_from(">I", eb, (nlongs - 1) * 4)[0]
+
+    if len(bm_blknums) < old_bm_need:
+        return False, (f"Bitmap chain has {len(bm_blknums)} blocks, "
+                       f"expected at least {old_bm_need}.")
+
+    # Phase 4: check available chain capacity for new bm pointers
+    root_free     = max(0, _FFS_ROOT_BM_MAX - len(bm_blknums))
+    last_ext_free = (_FFS_EXT_BM_MAX - ext_chain[-1][1]) if ext_chain else 0
+    avail_slots   = root_free + last_ext_free
+
+    new_ext_relblks = []
+    if num_new_bm > avail_slots:
+        overflow    = num_new_bm - avail_slots
+        num_new_ext = (overflow + _FFS_EXT_BM_MAX - 1) // _FFS_EXT_BM_MAX
+        if num_new_ext > _FFS_MAX_EXT_CHAIN:
+            return False, (f"Grow requires {num_new_ext} new ext blocks "
+                           f"(max {_FFS_MAX_EXT_CHAIN}).")
+        for ei in range(num_new_ext):
+            pos = reserved + (new_bm_need - 1) * bpbm + 1 + ei
+            if pos >= new_blocks:
+                return False, f"No room in new partition space for ext block {ei}."
+            new_ext_relblks.append(pos)
+
+    # Phase 5: update last existing bitmap block to cover newly-available blocks
+    prog("Extending last bitmap block...")
+    if old_bm_need > 0:
+        bm_idx    = old_bm_need - 1
+        range_end = reserved + old_bm_need * bpbm
+        free_end  = min(range_end, new_blocks)
+        if old_blocks < free_end:
+            bm_buf = read_blk(part_abs + bm_blknums[bm_idx])
+            if not bm_buf:
+                return False, f"Cannot read last bm block {bm_blknums[bm_idx]}."
+            for b in range(old_blocks, free_end):
+                _bm_setfree(bm_buf, b - reserved - bm_idx * bpbm)
+            struct.pack_into(">I", bm_buf, 0, 0)
+            struct.pack_into(">I", bm_buf, 0, _ffs_checksum(bytes(bm_buf), nlongs))
+            if not write_blk(part_abs + bm_blknums[bm_idx], bm_buf):
+                return False, f"Failed to write updated bm block {bm_blknums[bm_idx]}."
+
+    # Phase 6: create new bitmap blocks for the extended range
+    prog("Writing new bitmap blocks...")
+    for k in range(num_new_bm):
+        bm_idx  = old_bm_need + k
+        abs_blk = reserved + bm_idx * bpbm
+        b_start = reserved + bm_idx * bpbm
+        b_end   = min(reserved + (bm_idx + 1) * bpbm, new_blocks)
+        bm_blknums.append(abs_blk)
+
+        bm_buf = bytearray(eff_bsz)
+        for b in range(b_start, b_end):
+            _bm_setfree(bm_buf, b - b_start)
+        _bm_setused(bm_buf, 0)   # the bm block itself is at abs_blk = b_start
+        for ep in new_ext_relblks:
+            if b_start <= ep < b_end:
+                _bm_setused(bm_buf, ep - b_start)
+        struct.pack_into(">I", bm_buf, 0, 0)
+        struct.pack_into(">I", bm_buf, 0, _ffs_checksum(bytes(bm_buf), nlongs))
+        if not write_blk(part_abs + abs_blk, bm_buf):
+            return False, f"Failed to write new bm block {abs_blk} (abs {part_abs + abs_blk})."
+
+    # Phase 7: add new bm block numbers to the pointer chain
+    prog("Updating bitmap chain in root...")
+    src_idx = old_bm_need
+    added   = 0
+
+    i = old_bm_need
+    while i < _FFS_ROOT_BM_MAX and added < num_new_bm:
+        struct.pack_into(">I", root_buf, (_FFS_RL_BM_PAGES + i) * 4, bm_blknums[src_idx])
+        i += 1; added += 1; src_idx += 1
+
+    if added < num_new_bm and ext_chain:
+        last_ext_blk, last_ext_used = ext_chain[-1]
+        eb = read_blk(part_abs + last_ext_blk)
+        if not eb:
+            return False, f"Cannot re-read last ext block {last_ext_blk}."
+        slot = last_ext_used
+        while slot < _FFS_EXT_BM_MAX and added < num_new_bm:
+            struct.pack_into(">I", eb, slot * 4, bm_blknums[src_idx])
+            slot += 1; added += 1; src_idx += 1
+        struct.pack_into(">I", eb, (nlongs - 1) * 4,
+                         new_ext_relblks[0] if new_ext_relblks else 0)
+        if not write_blk(part_abs + last_ext_blk, eb):
+            return False, f"Failed to write updated ext block {last_ext_blk}."
+
+    for ei, ep in enumerate(new_ext_relblks):
+        eb   = bytearray(eff_bsz)
+        slot = 0
+        while slot < _FFS_EXT_BM_MAX and added < num_new_bm:
+            struct.pack_into(">I", eb, slot * 4, bm_blknums[src_idx])
+            slot += 1; added += 1; src_idx += 1
+        next_ep = new_ext_relblks[ei + 1] if ei + 1 < len(new_ext_relblks) else 0
+        struct.pack_into(">I", eb, (nlongs - 1) * 4, next_ep)
+        if not write_blk(part_abs + ep, eb):
+            return False, f"Failed to write new ext block {ep} (abs {part_abs + ep})."
+
+    if new_ext_relblks and not ext_chain:
+        struct.pack_into(">I", root_buf, _FFS_RL_BM_EXT * 4, new_ext_relblks[0])
+    elif not new_ext_relblks and not ext_chain:
+        struct.pack_into(">I", root_buf, _FFS_RL_BM_EXT * 4, 0)
+
+    # Phase 8: relocate root block to (reserved + new_blocks - 1) / 2
+    prog("Relocating root block...")
+    new_root  = (reserved + new_blocks - 1) // 2
+    if new_root < reserved:
+        return False, f"new_root {new_root} < reserved {reserved} — impossible geometry."
+
+    bm_idx_nr = (new_root  - reserved) // bpbm
+    bm_idx_or = ((root_blk - reserved) // bpbm) if root_blk >= reserved else 0
+
+    if bm_idx_nr >= len(bm_blknums):
+        return False, (f"new_root bm index {bm_idx_nr} out of range "
+                       f"(bm_count={len(bm_blknums)}).")
+
+    nr_bm_buf = read_blk(part_abs + bm_blknums[bm_idx_nr])
+    if not nr_bm_buf:
+        return False, "Cannot read bm block for root relocation."
+    off_nr = (new_root - reserved) % bpbm
+    _bm_setused(nr_bm_buf, off_nr)
+    if new_root != root_blk and bm_idx_or == bm_idx_nr and root_blk >= reserved:
+        _bm_setfree(nr_bm_buf, (root_blk - reserved) % bpbm)
+    struct.pack_into(">I", nr_bm_buf, 0, 0)
+    struct.pack_into(">I", nr_bm_buf, 0, _ffs_checksum(bytes(nr_bm_buf), nlongs))
+    if not write_blk(part_abs + bm_blknums[bm_idx_nr], nr_bm_buf):
+        return False, "Failed to write bm block for root relocation."
+
+    if new_root != root_blk and bm_idx_or != bm_idx_nr and root_blk >= reserved:
+        if bm_idx_or < len(bm_blknums):
+            or_bm_buf = read_blk(part_abs + bm_blknums[bm_idx_or])
+            if or_bm_buf:
+                _bm_setfree(or_bm_buf, (root_blk - reserved) % bpbm)
+                struct.pack_into(">I", or_bm_buf, 0, 0)
+                struct.pack_into(">I", or_bm_buf, 0, _ffs_checksum(bytes(or_bm_buf), nlongs))
+                write_blk(part_abs + bm_blknums[bm_idx_or], or_bm_buf)
+
+    # Write root at new position; clear fields FFS validates; bm_flag=0 → FFS rebuilds
+    struct.pack_into(">I", root_buf,   4,   0)    # rb_OwnKey  = 0
+    struct.pack_into(">I", root_buf,   8,   0)    # rb_SeqNum  = 0
+    struct.pack_into(">I", root_buf,  12,  72)    # rb_HTSize  = 72
+    struct.pack_into(">I", root_buf,  16,   0)    # rb_Nothing1 = 0
+    struct.pack_into(">I", root_buf, 500,   0)    # rb_Parent  = 0  (L[125])
+    struct.pack_into(">I", root_buf, _FFS_RL_BM_FLAG * 4, 0)
+    struct.pack_into(">I", root_buf, _FFS_RL_CHKSUM  * 4, 0)
+    struct.pack_into(">I", root_buf, _FFS_RL_CHKSUM  * 4, _ffs_checksum(bytes(root_buf), nlongs))
+    if not write_blk(part_abs + new_root, root_buf):
+        return False, f"Failed to write root at new position {new_root} (abs {part_abs + new_root})."
+
+    # Phase 9b: update fhb_Parent in root's direct children (hash table entries)
+    prog("Updating file/directory parent pointers...")
+    FHB_PARENT    = nlongs - 3   # L[125] = vfhb_Parent
+    FHB_HASHCHAIN = nlongs - 4   # L[124] = vfhb_HashChain
+    if new_root != root_blk:
+        for ht_i in range(72):
+            blkno = struct.unpack_from(">I", root_buf, (6 + ht_i) * 4)[0]
+            depth = 0
+            while blkno and depth < 512:
+                depth += 1
+                fhb = read_blk(part_abs + blkno)
+                if not fhb:
+                    break
+                if (struct.unpack_from(">I", fhb, 0)[0] != _FFS_T_SHORT or
+                        struct.unpack_from(">I", fhb, 4)[0] != blkno):
+                    break
+                next_blkno = struct.unpack_from(">I", fhb, FHB_HASHCHAIN * 4)[0]
+                struct.pack_into(">I", fhb, FHB_PARENT   * 4, new_root)
+                struct.pack_into(">I", fhb, _FFS_RL_CHKSUM * 4, 0)
+                struct.pack_into(">I", fhb, _FFS_RL_CHKSUM * 4, _ffs_checksum(bytes(fhb), nlongs))
+                write_blk(part_abs + blkno, fhb)
+                blkno = next_blkno
+
+    # Phase 9: update boot block bb[2] to new_root
+    prog("Updating boot block...")
+    struct.pack_into(">I", boot_buf, 8, new_root)   # L[2]
+    struct.pack_into(">I", boot_buf, 4, 0)           # L[1] = checksum field
+    bbsum = 0
+    for i in range(nlongs):
+        prev  = bbsum
+        bbsum = (bbsum + struct.unpack_from(">I", boot_buf, i * 4)[0]) & 0xFFFFFFFF
+        if bbsum < prev:
+            bbsum = (bbsum + 1) & 0xFFFFFFFF
+    struct.pack_into(">I", boot_buf, 4, (~bbsum) & 0xFFFFFFFF)
+    if not write_blk(part_abs, boot_buf):
+        return False, "Failed to update boot block."
+
+    # Phase 9c: stamp bm_flag=VALID on old root so FFS doesn't run its validator
+    if new_root != root_blk:
+        old_root_buf = read_blk(part_abs + root_blk)
+        if (old_root_buf and
+                struct.unpack_from(">I", old_root_buf, 0)[0] == _FFS_T_SHORT and
+                struct.unpack_from(">I", old_root_buf, (nlongs - 1) * 4)[0] == _FFS_ST_ROOT and
+                struct.unpack_from(">I", old_root_buf, _FFS_RL_BM_FLAG * 4)[0] != _FFS_BM_VALID):
+            struct.pack_into(">I", old_root_buf, _FFS_RL_BM_FLAG * 4, _FFS_BM_VALID)
+            struct.pack_into(">I", old_root_buf, _FFS_RL_CHKSUM  * 4, 0)
+            struct.pack_into(">I", old_root_buf, _FFS_RL_CHKSUM  * 4,
+                             _ffs_checksum(bytes(old_root_buf), nlongs))
+            write_blk(part_abs + root_blk, old_root_buf)   # non-fatal if fails
+
+    msg = (f"FFS filesystem grown.\n"
+           f"old_hi={old_hi}  new_hi={pi.high_cyl}\n"
+           f"old_blocks={old_blocks}  new_blocks={new_blocks}\n"
+           f"new_bm_need={new_bm_need}  num_new_bm={num_new_bm}\n"
+           f"Root: rel {root_blk} → rel {new_root}")
+    return True, msg
+
+# ── PFS filesystem grow ─────────────────────────────────────────────────────────
+
+_PFS_OFF_OPTIONS      =  4
+_PFS_OFF_RBLKCLUSTER  = 66   # UWORD
+_PFS_OFF_RESERVED_BSZ = 64   # UWORD
+_PFS_OFF_BLOCKSFREE   = 68
+_PFS_OFF_LASTRESERVED = 52
+_PFS_OFF_RESERVED_FREE = 60
+_PFS_OFF_DISKSIZE     = 84
+_PFS_MODE_SIZEFIELD   = 16
+_PFS_MODE_SUPERINDEX  = 128
+_PFS_ID_PFS1          = 0x50465301
+_PFS_ID_PFS2          = 0x50465302
+
+
+def _pfs_grow(dev: str, rdb, pi, old_hi: int, progress_cb=None) -> tuple:
+    """Grow a PFS2/PFS3 filesystem to match pi.high_cyl (already updated).
+    Ports DiskPart pfsresize.c algorithm faithfully.
+    Returns (True, msg) or (False, err_str)."""
+
+    heads   = pi.surfaces    or rdb.heads
+    sectors = pi.blk_per_trk or rdb.sectors
+    if not heads or not sectors:
+        return False, f"Invalid geometry (heads={heads}, sectors={sectors})."
+
+    phys_per_lb = (pi.size_block * 4 // 512) if pi.size_block * 4 >= 1024 else 1
+    rb_lblock   = pi.reserved if pi.reserved > 0 else 2
+    part_abs    = (pi.low_cyl * heads * sectors + rb_lblock) * phys_per_lb
+
+    def prog(msg):
+        if progress_cb:
+            progress_cb(msg)
+
+    def read_cluster(start, count):
+        out = bytearray()
+        for k in range(count):
+            b = _read_block(dev, start + k)
+            if b is None:
+                return None
+            out.extend(b)
+        return out
+
+    def write_cluster(start, data):
+        for k in range(len(data) // 512):
+            if not _write_block(dev, start + k, bytes(data[k * 512:(k + 1) * 512])):
+                return False
+        return True
+
+    # Phase 1/2: read + validate rootblock
+    prog("Reading PFS rootblock...")
+    first = _read_block(dev, part_abs)
+    if first is None:
+        return False, f"Cannot read PFS rootblock (abs {part_abs})."
+    disktype = struct.unpack_from(">I", first, 0)[0]
+    if disktype not in (_PFS_ID_PFS1, _PFS_ID_PFS2):
+        return False, (f"Not a PFS rootblock (disktype=0x{disktype:08X}).\n"
+                       f"Expected 0x{_PFS_ID_PFS1:08X} (PFS\\1) or "
+                       f"0x{_PFS_ID_PFS2:08X} (PFS\\2).")
+    rblkcluster  = struct.unpack_from(">H", first, _PFS_OFF_RBLKCLUSTER)[0]
+    reserved_bsz = struct.unpack_from(">H", first, _PFS_OFF_RESERVED_BSZ)[0]
+    if rblkcluster == 0:
+        return False, "PFS rootblock has rblkcluster=0."
+    if reserved_bsz < 512 or reserved_bsz & 3:
+        return False, f"Unexpected reserved_blksize={reserved_bsz}."
+    cluster_phys = rblkcluster * phys_per_lb
+
+    # Phase 3: read full rootblock cluster
+    prog("Reading rootblock cluster...")
+    cluster_buf = read_cluster(part_abs, cluster_phys)
+    if cluster_buf is None:
+        return False, f"Cannot read rootblock cluster ({cluster_phys} sectors at abs {part_abs})."
+
+    # Phase 4: read fields and compute delta
+    options       = struct.unpack_from(">I", cluster_buf, _PFS_OFF_OPTIONS)[0]
+    lastreserved  = struct.unpack_from(">I", cluster_buf, _PFS_OFF_LASTRESERVED)[0]
+    reserved_free = struct.unpack_from(">I", cluster_buf, _PFS_OFF_RESERVED_FREE)[0]
+    blocksfree    = struct.unpack_from(">I", cluster_buf, _PFS_OFF_BLOCKSFREE)[0]
+    cur_disksize  = struct.unpack_from(">I", cluster_buf, _PFS_OFF_DISKSIZE)[0]
+
+    if options & _PFS_MODE_SUPERINDEX:
+        return False, "PFS partition uses SUPERINDEX — not supported by this tool."
+
+    # Derive delta from PFS3's own disksize to avoid DosEnvec geometry mismatch
+    old_ncyl     = max(1, old_hi - pi.low_cyl + 1)
+    cyl_diff     = pi.high_cyl - old_hi
+    bpc          = (cur_disksize // old_ncyl) if (old_ncyl > 0 and cur_disksize > 0) \
+                   else (heads * sectors)
+    delta_blocks = cyl_diff * bpc
+    new_disksize = cur_disksize + delta_blocks
+
+    longsperbmb = reserved_bsz // 4 - 3
+    bm_coverage = longsperbmb * 32 if longsperbmb else 1
+    bitmapstart = lastreserved + 1
+    old_user    = max(0, cur_disksize - bitmapstart)
+    new_user    = max(0, new_disksize - bitmapstart)
+    old_num_bmb = (old_user + bm_coverage - 1) // bm_coverage
+    new_num_bmb = (new_user + bm_coverage - 1) // bm_coverage
+    num_new_bmb = max(0, new_num_bmb - old_num_bmb)
+    idxperblk   = longsperbmb if longsperbmb else 1
+    old_num_idx = (old_num_bmb + idxperblk - 1) // idxperblk if old_num_bmb else 0
+    new_num_idx = (new_num_bmb + idxperblk - 1) // idxperblk if new_num_bmb else 0
+    num_new_idx = max(0, new_num_idx - old_num_idx)
+    reserved_needed = num_new_bmb + num_new_idx
+
+    if reserved_needed > reserved_free:
+        return False, (f"PFS reserved area is too full.\n"
+                       f"Need {reserved_needed} free reserved blocks "
+                       f"({num_new_bmb} bitmap + {num_new_idx} index),\n"
+                       f"but only {reserved_free} are available.\n"
+                       f"Reformat with a larger reserved area to proceed.")
+    if cur_disksize > 0 and blocksfree > cur_disksize:
+        return False, (f"PFS metadata corrupted "
+                       f"(blocksfree={blocksfree} > disksize={cur_disksize}).\n"
+                       f"Run PFSDoctor before growing.")
+
+    # Phase 5: update fields in cluster buffer
+    if options & _PFS_MODE_SIZEFIELD:
+        struct.pack_into(">I", cluster_buf, _PFS_OFF_DISKSIZE, new_disksize)
+    struct.pack_into(">I", cluster_buf, _PFS_OFF_BLOCKSFREE, blocksfree + delta_blocks)
+
+    # Phase 6: write updated cluster
+    prog("Writing PFS rootblock cluster...")
+    if not write_cluster(part_abs, cluster_buf):
+        return False, "Cannot write PFS rootblock cluster."
+
+    # Phase 7: clear MODE_SIZEFIELD (second write, non-fatal if it fails)
+    if options & _PFS_MODE_SIZEFIELD:
+        struct.pack_into(">I", cluster_buf, _PFS_OFF_OPTIONS, options & ~_PFS_MODE_SIZEFIELD)
+        write_cluster(part_abs, cluster_buf)
+
+    msg = (f"PFS filesystem grown.\n"
+           f"cyl+{cyl_diff}  bpc={bpc}  delta={delta_blocks}\n"
+           f"blocksfree: {blocksfree} → {blocksfree + delta_blocks}\n"
+           f"disksize:   {cur_disksize} → {new_disksize}")
+    return True, msg
+
+
 # ─── RDB read ──────────────────────────────────────────────────────────────────
 
 def read_rdb(dev: str) -> Optional[RDBInfo]:
@@ -1262,6 +2013,12 @@ class EditPartitionDialog(tk.Toplevel):
                 f"Cylinder range must be within {self._min_lo}–{self._max_hi} "
                 f"and low ≤ high.", parent=self); return
 
+        if lo < self._orig.low_cyl:
+            messagebox.showerror("Cannot Resize From Start",
+                "Filesystem resize is only possible when the start cylinder is left "
+                "unchanged.\n\nTo grow a partition, drag the right edge or use the "
+                "Grow Partition button instead.", parent=self); return
+
         # Warn if cylinder range changed (data loss risk)
         resized = (lo != self._orig.low_cyl or hi != self._orig.high_cyl)
         if resized:
@@ -1579,6 +2336,295 @@ class _DDProgressDialog(tk.Toplevel):
         self.destroy()
 
 
+# ─── Move / Grow dialogs ───────────────────────────────────────────────────────
+
+class MovePartitionDialog(tk.Toplevel):
+    """Warning + progress dialog for a physical partition move (block copy)."""
+
+    def __init__(self, parent, dev: str, rdb, pi, preset_lo: int = None):
+        super().__init__(parent)
+        self.title("WARNING: Move Partition — Data Hazard")
+        self.resizable(False, False)
+        self.grab_set()
+        self.transient(parent)
+        self._dev       = dev
+        self._rdb       = rdb
+        self._pi        = pi
+        self._preset_lo = preset_lo if preset_lo is not None else pi.low_cyl
+        self.result = None      # set to new_lo (int) on success
+        self._q: queue.Queue = queue.Queue()
+        self._build()
+        self.wait_window()
+
+    def _build(self):
+        f = tk.Frame(self, padx=14, pady=10)
+        f.pack(fill="both", expand=True)
+
+        tk.Label(f, justify="left", fg="#cc2200", font=("", 0, "bold"),
+                 text=(
+                     "WARNING:  MOVING A PARTITION COPIES ALL DATA ON DISK.\n\n"
+                     f"Partition {self._pi.drive_name} "
+                     f"(cyl {self._pi.low_cyl}\u2013{self._pi.high_cyl}) "
+                     "will be physically copied to the\n"
+                     "cylinder you enter below.\n\n"
+                     "POWER LOSS OR CRASH DURING THIS PROCESS WILL\n"
+                     "PERMANENTLY DESTROY YOUR DATA.  No rollback."
+                 )).pack(anchor="w", pady=(0, 8))
+
+        row = tk.Frame(f)
+        row.pack(fill="x", pady=4)
+        tk.Label(row, text="New start cylinder:").pack(side="left")
+        self._cyl_var = tk.StringVar(value=str(self._preset_lo))
+        self._cyl_entry = ttk.Entry(row, textvariable=self._cyl_var, width=10)
+        self._cyl_entry.pack(side="left", padx=6)
+
+        self._range_lbl = tk.Label(f, fg="#555555", justify="left", text="")
+        self._range_lbl.pack(anchor="w")
+        self._cyl_var.trace_add("write", self._upd_range)
+        self._upd_range()
+
+        self._backup_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text=f"I have a current backup of {self._pi.drive_name}",
+                        variable=self._backup_var).pack(anchor="w", pady=(8, 2))
+
+        self._dd_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f, text="Use dd (faster — large kernel-buffered transfers)",
+                        variable=self._dd_var).pack(anchor="w", pady=(0, 4))
+
+        self._prog_frame = tk.Frame(f)
+        self._prog_bar   = ttk.Progressbar(self._prog_frame, mode="determinate",
+                                           length=400, maximum=100)
+        self._prog_bar.pack(fill="x")
+        self._prog_lbl = tk.Label(self._prog_frame, text="", fg="#333333")
+        self._prog_lbl.pack(anchor="w")
+
+        bf = tk.Frame(f)
+        bf.pack(fill="x", pady=(10, 0))
+        self._btn_move   = ttk.Button(bf, text="Move Partition", width=16,
+                                      command=self._on_move)
+        self._btn_cancel = ttk.Button(bf, text="Cancel", width=10,
+                                      command=self.destroy)
+        self._btn_move.pack(side="left", padx=4)
+        self._btn_cancel.pack(side="left", padx=4)
+
+    def _upd_range(self, *_):
+        try:
+            new_lo = int(self._cyl_var.get())
+        except ValueError:
+            self._range_lbl.config(text="")
+            return
+        ok, result = _part_can_move(self._rdb, self._pi, new_lo)
+        if ok:
+            heads   = self._pi.surfaces    or self._rdb.heads
+            sectors = self._pi.blk_per_trk or self._rdb.sectors
+            cyl_cnt = self._pi.high_cyl - self._pi.low_cyl + 1
+            phys    = cyl_cnt * heads * sectors
+            self._range_lbl.config(
+                text=f"New range: cyl {new_lo}\u2013{result}  ({phys} blocks)",
+                fg="#006600")
+        else:
+            self._range_lbl.config(text=result, fg="#cc2200")
+
+    def _on_move(self):
+        if not self._backup_var.get():
+            messagebox.showwarning("Backup Required",
+                "Tick the backup confirmation checkbox before proceeding.",
+                parent=self)
+            return
+        try:
+            new_lo = int(self._cyl_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Enter a valid cylinder number.", parent=self)
+            return
+        ok, result = _part_can_move(self._rdb, self._pi, new_lo)
+        if not ok:
+            messagebox.showerror("Cannot Move", result, parent=self)
+            return
+
+        heads   = self._pi.surfaces    or self._rdb.heads
+        sectors = self._pi.blk_per_trk or self._rdb.sectors
+        phys    = (self._pi.high_cyl - self._pi.low_cyl + 1) * heads * sectors
+        if not messagebox.askyesno("Confirm Move",
+                f"Move {self._pi.drive_name} from cyl {self._pi.low_cyl}\u2013"
+                f"{self._pi.high_cyl} to cyl {new_lo}\u2013{result}?\n\n"
+                f"This will copy {phys} physical blocks.\n"
+                "There is NO UNDO.  Continue?",
+                parent=self, icon="warning"):
+            return
+
+        use_dd = self._dd_var.get()
+
+        if use_dd:
+            phys_old   = self._pi.low_cyl * heads * sectors
+            phys_new   = new_lo           * heads * sectors
+            phys_total = (self._pi.high_cyl - self._pi.low_cyl + 1) * heads * sectors
+            overlapping = (phys_new > phys_old) and (phys_new < phys_old + phys_total)
+
+            if not overlapping:
+                # Use _DDProgressDialog for live progress via dd status=progress.
+                cmd = ["dd", f"if={self._dev}", f"of={self._dev}", "bs=1M",
+                       f"skip={phys_old * 512}", f"seek={phys_new * 512}",
+                       f"count={phys_total * 512}",
+                       "iflag=skip_bytes,count_bytes", "oflag=seek_bytes",
+                       "conv=notrunc", "status=progress"]
+                dlg = _DDProgressDialog(self, "Moving Partition…",
+                                        cmd, phys_total * 512)
+                if not dlg.success:
+                    return
+                # SFS metadata fixup (tiny — synchronous is fine)
+                sfs_ok, sfs_msg = _sfs_fixup_after_move(
+                    self._dev, self._rdb, self._pi, new_lo)
+                if not sfs_ok:
+                    messagebox.showwarning("SFS Fixup Warning", sfs_msg, parent=self)
+                self.result = new_lo
+                messagebox.showinfo("Partition Moved",
+                    f"Partition {self._pi.drive_name} moved successfully.\n\n"
+                    "Write RDB to disk to update the partition table, then reboot.",
+                    parent=self)
+                self.destroy()
+                return
+
+        # Python path (or overlapping-higher dd fallback): thread + poll progress.
+        self._new_lo = new_lo
+        self._use_dd = use_dd
+        self._btn_move.config(state="disabled")
+        self._btn_cancel.config(state="disabled")
+        self._cyl_entry.config(state="disabled")
+        self._prog_frame.pack(fill="x", pady=4)
+        threading.Thread(target=self._run_move, daemon=True).start()
+        self.after(100, self._poll)
+
+    def _run_move(self):
+        def cb(done, total, phase):
+            self._q.put(("progress", done, total, phase))
+        ok, msg = _part_move_data(self._dev, self._rdb, self._pi, self._new_lo, cb,
+                                  use_dd=self._use_dd)
+        self._q.put(("done", ok, msg))
+
+    def _poll(self):
+        while not self._q.empty():
+            item = self._q.get_nowait()
+            if item[0] == "progress":
+                _, done, total, phase = item
+                pct = int(done * 100 / total) if total else 0
+                self._prog_bar["value"] = pct
+                self._prog_lbl.config(text=f"{phase}  {pct}%")
+            elif item[0] == "done":
+                _, ok, msg = item
+                self._prog_bar.config(mode="determinate", value=100 if ok else 0)
+                if ok:
+                    self.result = self._new_lo
+                    messagebox.showinfo("Partition Moved",
+                        f"Partition {self._pi.drive_name} moved successfully.\n\n"
+                        f"{msg}\n\n"
+                        "Write RDB to disk to update the partition table, then reboot.",
+                        parent=self)
+                else:
+                    messagebox.showerror("Move Failed",
+                        f"Move FAILED:\n{msg}\n\n"
+                        "Data may be partially written.\n"
+                        "Restore from backup before rebooting.",
+                        parent=self)
+                self.destroy()
+                return
+        self.after(100, self._poll)
+
+
+class GrowPartitionDialog(tk.Toplevel):
+    """Dialog for extending a partition's high cylinder."""
+
+    def __init__(self, parent, rdb, pi):
+        super().__init__(parent)
+        self.title(f"Grow Partition \u2014 {pi.drive_name}")
+        self.resizable(False, False)
+        self.grab_set()
+        self.transient(parent)
+        self._rdb = rdb
+        self._pi  = pi
+        self.result = None   # set to new_hi (int) on OK
+        self._build()
+        self.wait_window()
+
+    def _build(self):
+        f = tk.Frame(self, padx=14, pady=12)
+        f.pack(fill="both", expand=True)
+
+        heads   = self._pi.surfaces    or self._rdb.heads
+        sectors = self._pi.blk_per_trk or self._rdb.sectors
+        cur_sz  = fmt_size(self._pi.size_bytes)
+        tk.Label(f, justify="left",
+                 text=f"Current range: cyl {self._pi.low_cyl}\u2013{self._pi.high_cyl}  ({cur_sz})"
+                 ).pack(anchor="w", pady=(0, 4))
+
+        max_hi = self._rdb.hicyl
+        for other in self._rdb.partitions:
+            if other is self._pi:
+                continue
+            if other.low_cyl > self._pi.high_cyl:
+                max_hi = min(max_hi, other.low_cyl - 1)
+        tk.Label(f, text=f"Maximum available: cyl {max_hi}",
+                 fg="#333333").pack(anchor="w", pady=(0, 8))
+
+        row = tk.Frame(f)
+        row.pack(fill="x", pady=4)
+        tk.Label(row, text="New high cylinder:").pack(side="left")
+        self._hi_var = tk.StringVar(value=str(min(self._pi.high_cyl + 1, max_hi)))
+        ttk.Entry(row, textvariable=self._hi_var, width=10).pack(side="left", padx=6)
+
+        self._size_lbl = tk.Label(f, fg="#333333", text="")
+        self._size_lbl.pack(anchor="w")
+        self._hi_var.trace_add("write", self._upd_size)
+        self._upd_size()
+
+        if _ffs_is_type(self._pi.dos_type):
+            notice = "FFS filesystem grow will be offered after confirmation."
+        elif _pfs_is_type(self._pi.dos_type):
+            notice = "PFS filesystem grow will be offered after confirmation."
+        elif _sfs_is_type(self._pi.dos_type):
+            notice = ("SFS: only the RDB entry will be updated.\n"
+                      "Run SFScheck after reboot to expand the filesystem.")
+        else:
+            notice = "Only the RDB partition entry will be updated."
+        tk.Label(f, text=notice, fg="#555577", justify="left",
+                 wraplength=360).pack(anchor="w", pady=(6, 0))
+
+        bf = tk.Frame(f)
+        bf.pack(fill="x", pady=(12, 0))
+        ttk.Button(bf, text="Grow",   width=10, command=self._ok).pack(side="left", padx=4)
+        ttk.Button(bf, text="Cancel", width=10, command=self.destroy).pack(side="left", padx=4)
+
+    def _upd_size(self, *_):
+        try:
+            new_hi = int(self._hi_var.get())
+        except ValueError:
+            self._size_lbl.config(text="")
+            return
+        ok_r = _part_can_grow(self._rdb, self._pi, new_hi)
+        if ok_r[0]:
+            heads   = self._pi.surfaces    or self._rdb.heads
+            sectors = self._pi.blk_per_trk or self._rdb.sectors
+            cyls    = new_hi - self._pi.low_cyl + 1
+            new_sz  = fmt_size(cyls * heads * sectors * 512)
+            self._size_lbl.config(
+                text=f"New range: cyl {self._pi.low_cyl}\u2013{new_hi}  ({new_sz})",
+                fg="#006600")
+        else:
+            self._size_lbl.config(text=ok_r[1], fg="#cc2200")
+
+    def _ok(self):
+        try:
+            new_hi = int(self._hi_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid Input", "Enter a valid cylinder number.", parent=self)
+            return
+        ok_r = _part_can_grow(self._rdb, self._pi, new_hi)
+        if not ok_r[0]:
+            messagebox.showerror("Cannot Grow", ok_r[1], parent=self)
+            return
+        self.result = new_hi
+        self.destroy()
+
+
 # ─── Main window ───────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
@@ -1593,7 +2639,8 @@ class App(tk.Tk):
         self._image_files = []   # user-opened .img files treated as disks
         self._cur_disk = None
         self._rdb: Optional[RDBInfo] = None
-        self._drag: Optional[dict] = None   # {"start": cyl, "end": cyl}
+        self._drag: Optional[dict] = None       # create drag  {"start": cyl, "end": cyl}
+        self._part_drag: Optional[dict] = None  # move/grow drag
         self._build_menu()
         self._build_ui()
         self.after(100, self._refresh_disks)
@@ -1611,8 +2658,10 @@ class App(tk.Tk):
         fm.add_command(label="Quit", command=self.quit)
         mb.add_cascade(label="File", menu=fm)
         tm = tk.Menu(mb, tearoff=0)
-        tm.add_command(label="Backup RDB Blocks…", command=self._do_backup_rdb)
-        tm.add_command(label="Restore RDB Blocks…", command=self._do_restore_rdb)
+        tm.add_command(label="Backup RDB Blocks…",          command=self._do_backup_rdb)
+        tm.add_command(label="Restore RDB Blocks…",         command=self._do_restore_rdb)
+        tm.add_command(label="Backup RDB Extended…",        command=self._do_backup_rdb_extended)
+        tm.add_command(label="Restore RDB Extended…",       command=self._do_restore_rdb_extended)
         tm.add_separator()
         tm.add_command(label="Image Disk to File…", command=self._do_image_disk)
         tm.add_command(label="Restore Disk from Image…", command=self._do_restore_image)
@@ -1731,11 +2780,17 @@ class App(tk.Tk):
                                       state="disabled")
         self._btn_write = ttk.Button(bf, text="✔  Write to Disk", command=self._do_write,
                                       state="disabled")
+        self._btn_move  = ttk.Button(bf, text="Move Partition",   command=self._do_move,
+                                      state="disabled")
+        self._btn_grow  = ttk.Button(bf, text="Grow Partition",   command=self._do_grow,
+                                      state="disabled")
         self._btn_init.grid( row=0, column=0, sticky="ew", padx=2)
         self._btn_add.grid(  row=0, column=1, sticky="ew", padx=2)
         self._btn_edit.grid( row=0, column=2, sticky="ew", padx=2)
         self._btn_del.grid(  row=0, column=3, sticky="ew", padx=2)
         self._btn_write.grid(row=0, column=4, sticky="ew", padx=2)
+        self._btn_move.grid( row=1, column=0, columnspan=2, sticky="ew", padx=2, pady=(2, 0))
+        self._btn_grow.grid( row=1, column=2, columnspan=3, sticky="ew", padx=2, pady=(2, 0))
 
         # Filesystem list — packed before partition list (above it, below buttons)
         fs_lf = ttk.LabelFrame(right, text="Filesystems")
@@ -1858,6 +2913,8 @@ class App(tk.Tk):
 
         self._btn_edit.config(state="disabled")
         self._btn_del.config(state="disabled")
+        self._btn_move.config(state="disabled")
+        self._btn_grow.config(state="disabled")
         self._refresh_parts()
         self._refresh_filesystems()
         self._draw_map()
@@ -1903,8 +2960,11 @@ class App(tk.Tk):
 
     def _on_part_sel(self, _=None):
         has_sel = bool(self._ptree.selection())
+        has_dev = bool(self._cur_disk)
         self._btn_edit.config(state="normal" if has_sel else "disabled")
-        self._btn_del.config(state="normal"  if has_sel else "disabled")
+        self._btn_del.config( state="normal" if has_sel else "disabled")
+        self._btn_move.config(state="normal" if (has_sel and has_dev) else "disabled")
+        self._btn_grow.config(state="normal" if (has_sel and has_dev) else "disabled")
         self._draw_map()
 
     # ── Disk map ──────────────────────────────────────────────────────────────
@@ -1996,6 +3056,45 @@ class App(tk.Tk):
                 c.create_text((gx1 + gx2) / 2, (y1 + y2) / 2,
                                text=sz_str, fill="white", font=("", 8, "bold"))
 
+        # Ghost for move/grow drag
+        if self._part_drag is not None:
+            pd   = self._part_drag
+            glo  = pd["ghost_lo"]
+            ghi  = pd["ghost_hi"]
+            gx1  = x_of(glo)
+            gx2  = x_of(ghi + 1)
+            if gx2 < gx1 + 2:
+                gx2 = gx1 + 2
+            # Dim original position
+            ox1 = x_of(pd["orig_lo"])
+            ox2 = x_of(pd["orig_hi"] + 1)
+            if ox2 < ox1 + 2: ox2 = ox1 + 2
+            c.create_rectangle(ox1, y1, ox2, y2,
+                                fill="#223344", outline="#556677", dash=(3, 3), width=1)
+            # Ghost at new position
+            ghost_col = "#ff9900" if pd["mode"] == "move" else "#00cc88"
+            c.create_rectangle(gx1, y1, gx2, y2,
+                                fill="", outline=ghost_col, dash=(4, 2), width=2)
+            gpw = gx2 - gx1
+            if gpw > 28:
+                cyls = ghi - glo + 1
+                sz_str = fmt_size(cyls * self._rdb.heads * self._rdb.sectors * 512)
+                lbl = f"{glo}\u2013{ghi}  {sz_str}"
+                c.create_text((gx1 + gx2) / 2, (y1 + y2) / 2,
+                               text=lbl, fill=ghost_col, font=("", 8, "bold"))
+
+        # Draw resize handle on selected partition's right edge
+        sel = self._ptree.selection()
+        if sel and not self._part_drag:
+            si = int(sel[0])
+            if 0 <= si < len(self._rdb.partitions):
+                sp   = self._rdb.partitions[si]
+                ex   = int(x_of(sp.high_cyl + 1))
+                hmid = (y1 + y2) // 2
+                hw   = 5
+                c.create_rectangle(ex - hw, hmid - 8, ex + hw, hmid + 8,
+                                    fill="#00cc88", outline="white", width=1)
+
         # Axis labels
         c.create_text(M,   H-2, text=f"Cyl {self._rdb.locyl}",
                       fill="#8888aa", font=("",7), anchor="sw")
@@ -2026,14 +3125,46 @@ class App(tk.Tk):
                 return False
         return True
 
+    def _map_hit_test(self, x: int) -> tuple:
+        """Return (kind, idx) where kind is 'free'|'body'|'edge', idx is partition index.
+        'edge' means within 8px of a partition's right edge (grow handle)."""
+        if not self._rdb:
+            return ("free", -1)
+        M  = 6
+        bw = self._canvas.winfo_width() - 2 * M
+        total = self._rdb.hicyl - self._rdb.locyl + 1
+        EDGE_PX = 8
+
+        def x_of(cyl):
+            t = max(0.0, min(1.0, (cyl - self._rdb.locyl) / total))
+            return M + t * bw
+
+        for i, p in enumerate(self._rdb.partitions):
+            ex  = x_of(p.high_cyl + 1)
+            sx  = x_of(p.low_cyl)
+            if abs(x - ex) <= EDGE_PX:
+                return ("edge", i)
+            if abs(x - sx) <= EDGE_PX:
+                return ("left_edge", i)
+            if sx <= x <= ex:
+                return ("body", i)
+        return ("free", -1)
+
     def _on_map_hover(self, event):
         if not self._rdb:
             self._canvas.config(cursor=""); return
         H = self._canvas.winfo_height()
         if not (6 <= event.y <= H - 18):
             self._canvas.config(cursor=""); return
-        self._canvas.config(
-            cursor="crosshair" if self._cyl_is_free(self._map_x_to_cyl(event.x)) else "")
+        kind, _ = self._map_hit_test(event.x)
+        if kind == "free":
+            self._canvas.config(cursor="crosshair")
+        elif kind == "edge":
+            self._canvas.config(cursor="sb_h_double_arrow")
+        elif kind == "left_edge":
+            self._canvas.config(cursor="X_cursor")
+        else:
+            self._canvas.config(cursor="fleur")
 
     def _on_map_press(self, event):
         if not self._rdb:
@@ -2041,22 +3172,48 @@ class App(tk.Tk):
         H = self._canvas.winfo_height()
         if not (6 <= event.y <= H - 18):
             return
-        cyl = self._map_x_to_cyl(event.x)
-        if not self._cyl_is_free(cyl):
-            for i, p in enumerate(self._rdb.partitions):
-                if p.low_cyl <= cyl <= p.high_cyl:
-                    self._ptree.selection_set(str(i))
-                    self._ptree.focus(str(i))
-                    self._ptree.see(str(i))
-                    self._on_part_sel()
-                    break
+        kind, idx = self._map_hit_test(event.x)
+        if kind == "free":
+            cyl = self._map_x_to_cyl(event.x)
+            snap = self._rdb.locyl
+            for p in self._rdb.partitions:
+                if p.high_cyl < cyl:
+                    snap = max(snap, p.high_cyl + 1)
+            self._drag = {"start": snap, "end": snap}
+            self._draw_map()
             return
-        # Snap start to the left edge of this free block
-        snap = self._rdb.locyl
-        for p in self._rdb.partitions:
-            if p.high_cyl < cyl:
-                snap = max(snap, p.high_cyl + 1)
-        self._drag = {"start": snap, "end": snap}
+        # Select the partition
+        self._ptree.selection_set(str(idx))
+        self._ptree.focus(str(idx))
+        self._ptree.see(str(idx))
+        self._on_part_sel()
+        p = self._rdb.partitions[idx]
+        if kind == "left_edge":
+            messagebox.showinfo(
+                "Cannot Resize From Start",
+                "Filesystem resize is only possible when the start cylinder is left "
+                "unchanged.\n\nTo grow a partition, drag the right edge instead.",
+                parent=self)
+            return
+        if kind == "edge":
+            self._part_drag = {
+                "mode":     "grow",
+                "idx":      idx,
+                "orig_lo":  p.low_cyl,
+                "orig_hi":  p.high_cyl,
+                "ghost_lo": p.low_cyl,
+                "ghost_hi": p.high_cyl,
+            }
+        else:
+            self._part_drag = {
+                "mode":       "move",
+                "idx":        idx,
+                "orig_lo":    p.low_cyl,
+                "orig_hi":    p.high_cyl,
+                "ghost_lo":   p.low_cyl,
+                "ghost_hi":   p.high_cyl,
+                "press_cyl":  self._map_x_to_cyl(event.x),
+            }
         self._draw_map()
 
     def _clamp_drag_end(self, start: int, raw_end: int) -> int:
@@ -2075,6 +3232,60 @@ class App(tk.Tk):
             return max(raw_end, limit)
 
     def _on_map_drag(self, event):
+        if self._part_drag is not None:
+            pd  = self._part_drag
+            idx = pd["idx"]
+            p   = self._rdb.partitions[idx]
+            raw = self._map_x_to_cyl(event.x)
+
+            if pd["mode"] == "grow":
+                # Only the right edge moves; must stay > low_cyl
+                lo    = pd["orig_lo"]
+                min_hi = lo   # keep at least 1 cylinder
+                max_hi = self._rdb.hicyl
+                for other in self._rdb.partitions:
+                    if other is p: continue
+                    if other.low_cyl > lo:
+                        max_hi = min(max_hi, other.low_cyl - 1)
+                pd["ghost_hi"] = max(min_hi, min(max_hi, raw))
+                cyls = pd["ghost_hi"] - lo + 1
+                sz   = cyls * self._rdb.heads * self._rdb.sectors * 512
+                self._status.set(
+                    f"Grow {p.drive_name}: cyl {lo}\u2013{pd['ghost_hi']}  "
+                    f"({cyls} cyl, {fmt_size(sz)})")
+
+            else:  # move
+                cyl_count = pd["orig_hi"] - pd["orig_lo"] + 1
+                offset    = raw - pd["press_cyl"]
+                new_lo    = pd["orig_lo"] + offset
+                new_hi    = new_lo + cyl_count - 1
+                # Clamp within disk bounds
+                if new_lo < self._rdb.locyl:
+                    new_lo = self._rdb.locyl
+                    new_hi = new_lo + cyl_count - 1
+                if new_hi > self._rdb.hicyl:
+                    new_hi = self._rdb.hicyl
+                    new_lo = new_hi - cyl_count + 1
+                # Clamp to avoid overlapping other partitions
+                for other in self._rdb.partitions:
+                    if other is p: continue
+                    if other.high_cyl < pd["orig_lo"] and other.high_cyl >= new_lo:
+                        new_lo = other.high_cyl + 1
+                        new_hi = new_lo + cyl_count - 1
+                    if other.low_cyl > pd["orig_hi"] and other.low_cyl <= new_hi:
+                        new_hi = other.low_cyl - 1
+                        new_lo = new_hi - cyl_count + 1
+                new_lo = max(self._rdb.locyl, new_lo)
+                new_hi = new_lo + cyl_count - 1
+                pd["ghost_lo"] = new_lo
+                pd["ghost_hi"] = new_hi
+                sz = cyl_count * self._rdb.heads * self._rdb.sectors * 512
+                self._status.set(
+                    f"Move {p.drive_name}: cyl {new_lo}\u2013{new_hi}  ({fmt_size(sz)})")
+
+            self._draw_map()
+            return
+
         if self._drag is None:
             return
         raw = self._map_x_to_cyl(event.x)
@@ -2083,7 +3294,9 @@ class App(tk.Tk):
         hi = max(self._drag["start"], self._drag["end"])
         cyls = hi - lo + 1
         sz = cyls * self._rdb.heads * self._rdb.sectors * 512
-        self._status.set(f"New partition: cyls {lo}–{hi}  ({cyls} cylinder{'s' if cyls != 1 else ''}, {fmt_size(sz)})")
+        self._status.set(
+            f"New partition: cyls {lo}\u2013{hi}  "
+            f"({cyls} cylinder{'s' if cyls != 1 else ''}, {fmt_size(sz)})")
         self._draw_map()
 
     def _on_map_double_click(self, event):
@@ -2102,6 +3315,79 @@ class App(tk.Tk):
                 return
 
     def _on_map_release(self, event):
+        # ── move/grow drag released ────────────────────────────────────────────
+        if self._part_drag is not None:
+            pd      = self._part_drag
+            idx     = pd["idx"]
+            pi      = self._rdb.partitions[idx]
+            mode    = pd["mode"]
+            glo     = pd["ghost_lo"]
+            ghi     = pd["ghost_hi"]
+            orig_lo = pd["orig_lo"]
+            orig_hi = pd["orig_hi"]
+            self._part_drag = None
+            self._draw_map()
+
+            if mode == "grow" and ghi != orig_hi:
+                ok_r = _part_can_grow(self._rdb, pi, ghi)
+                if not ok_r[0]:
+                    messagebox.showerror("Cannot Grow", ok_r[1], parent=self)
+                    return
+                pi.high_cyl = ghi
+                self._refresh_parts()
+                self._draw_map()
+                dev = self._cur_disk["path"] if self._cur_disk else None
+                if dev:
+                    if _ffs_is_type(pi.dos_type):
+                        if messagebox.askyesno("Grow FFS Filesystem",
+                                f"Partition {pi.drive_name} extended to cyl {ghi}.\n\n"
+                                "EXPERIMENTAL: Grow the FFS filesystem to match?\n\n"
+                                "This writes FFS bitmap blocks directly to disk.\n"
+                                "Always have a backup before proceeding.",
+                                parent=self, icon="warning"):
+                            ok, msg = _ffs_grow(dev, self._rdb, pi, orig_hi)
+                            if ok:
+                                messagebox.showinfo("FFS Grown",
+                                    f"FFS filesystem grown.\n\n{msg}\n\n"
+                                    "Write RDB, then reboot.", parent=self)
+                            else:
+                                messagebox.showerror("FFS Grow Failed", msg, parent=self)
+                    elif _pfs_is_type(pi.dos_type):
+                        if messagebox.askyesno("Grow PFS Filesystem",
+                                f"Partition {pi.drive_name} extended to cyl {ghi}.\n\n"
+                                "EXPERIMENTAL: Grow the PFS filesystem to match?\n\n"
+                                "This updates PFS rootblock metadata on disk.",
+                                parent=self, icon="warning"):
+                            ok, msg = _pfs_grow(dev, self._rdb, pi, orig_hi)
+                            if ok:
+                                messagebox.showinfo("PFS Grown",
+                                    f"PFS filesystem grown.\n\n{msg}\n\n"
+                                    "Write RDB, then reboot.", parent=self)
+                            else:
+                                messagebox.showerror("PFS Grow Failed", msg, parent=self)
+                self._status.set(
+                    f"Partition '{pi.drive_name}' grown to cyl {ghi}. "
+                    "Write to disk to save.")
+
+            elif mode == "move" and glo != orig_lo:
+                if not self._cur_disk:
+                    messagebox.showwarning("No Device",
+                        "Open a disk image or device first to move partitions.", parent=self)
+                    return
+                dev = self._cur_disk["path"]
+                dlg = MovePartitionDialog(self, dev, self._rdb, pi, preset_lo=glo)
+                if dlg.result is not None:
+                    cyl_cnt     = pi.high_cyl - pi.low_cyl + 1
+                    pi.low_cyl  = dlg.result
+                    pi.high_cyl = dlg.result + cyl_cnt - 1
+                    self._status.set(
+                        f"Partition '{pi.drive_name}' moved to cyl "
+                        f"{pi.low_cyl}\u2013{pi.high_cyl}. Write to disk to update RDB.")
+                self._refresh_parts()
+                self._draw_map()
+            return
+
+        # ── create drag released ───────────────────────────────────────────────
         if self._drag is None:
             return
         raw = self._map_x_to_cyl(event.x)
@@ -2183,7 +3469,9 @@ class App(tk.Tk):
             return
         self._rdb.partitions.pop(idx)
         self._btn_edit.config(state="disabled")
-        self._btn_del.config(state="disabled")
+        self._btn_del.config( state="disabled")
+        self._btn_move.config(state="disabled")
+        self._btn_grow.config(state="disabled")
         self._refresh_parts()
         self._draw_map()
         self._status.set(f"Partition '{p.drive_name}' removed. Write to disk to save.")
@@ -2235,28 +3523,43 @@ class App(tk.Tk):
 
         errors = []
 
-        if not _write_block(dev, rdsk_blk, build_rdsk_block(rdb)):
-            errors.append(f"Failed to write RDSK block at block {rdsk_blk}")
+        # Open once, write all RDB blocks, fsync once at the end.
+        try:
+            with open(dev, "r+b") as fh:
+                def write_at(blk, data):
+                    try:
+                        fh.seek(blk * 512)
+                        fh.write(data)
+                        return True
+                    except OSError:
+                        return False
 
-        for i, (p, blk) in enumerate(zip(rdb.partitions, part_blks)):
-            p.block_num = blk
-            p.next_part = part_blks[i+1] if i+1 < n_parts else END_MARK
-            if not _write_block(dev, blk, build_part_block(p, rdb.heads, rdb.sectors)):
-                errors.append(f"Failed to write PART block for {p.drive_name}")
+                if not write_at(rdsk_blk, build_rdsk_block(rdb)):
+                    errors.append(f"Failed to write RDSK block at block {rdsk_blk}")
 
-        for i, (fs, fshd_blk, (first_lseg, n_lseg)) in enumerate(
-                zip(rdb.filesystems, fshd_blks, lseg_runs)):
-            next_fshd = fshd_blks[i+1] if i+1 < n_fs else END_MARK
-            first_lseg_or_end = first_lseg if n_lseg > 0 else END_MARK
-            if not _write_block(dev, fshd_blk,
-                                build_fshd_block(fs, next_fshd, first_lseg_or_end)):
-                errors.append(f"Failed to write FSHD block for {fs.label}")
-            for blk_num, blk_data in build_lseg_blocks(fs, first_lseg):
-                if not _write_block(dev, blk_num, blk_data):
-                    errors.append(f"Failed to write LSEG block {blk_num} for {fs.label}")
+                for i, (p, blk) in enumerate(zip(rdb.partitions, part_blks)):
+                    p.block_num = blk
+                    p.next_part = part_blks[i+1] if i+1 < n_parts else END_MARK
+                    if not write_at(blk, build_part_block(p, rdb.heads, rdb.sectors)):
+                        errors.append(f"Failed to write PART block for {p.drive_name}")
+
+                for i, (fs, fshd_blk, (first_lseg, n_lseg)) in enumerate(
+                        zip(rdb.filesystems, fshd_blks, lseg_runs)):
+                    next_fshd = fshd_blks[i+1] if i+1 < n_fs else END_MARK
+                    first_lseg_or_end = first_lseg if n_lseg > 0 else END_MARK
+                    if not write_at(fshd_blk,
+                                    build_fshd_block(fs, next_fshd, first_lseg_or_end)):
+                        errors.append(f"Failed to write FSHD block for {fs.label}")
+                    for blk_num, blk_data in build_lseg_blocks(fs, first_lseg):
+                        if not write_at(blk_num, blk_data):
+                            errors.append(f"Failed to write LSEG block {blk_num} for {fs.label}")
+
+                fh.flush()
+        except OSError as e:
+            errors.append(f"Cannot open {dev} for writing: {e}")
 
         if errors:
-            messagebox.showerror("Write Errors", "\n".join(errors))
+            messagebox.showerror("Write Errors", "\n".join(errors), parent=self)
         else:
             part_info = ", ".join(str(b) for b in part_blks) or "none"
             fs_info   = ", ".join(str(b) for b in fshd_blks) or "none"
@@ -2265,7 +3568,8 @@ class App(tk.Tk):
                 f"  RDSK block: {rdsk_blk}\n"
                 f"  PART block(s): {part_info}\n"
                 f"  FSHD block(s): {fs_info}\n\n"
-                f"Use HDInstTools or HDToolBox on the Amiga to format.")
+                f"Reboot the Amiga, then format each partition from AmigaOS.",
+                parent=self)
             self._info["rdb"].config(
                 text=f"RDB written to disk ({n_parts} partition(s))",
                 foreground="#007700")
@@ -2457,6 +3761,142 @@ class App(tk.Tk):
             f"Re-select the disk to reload the RDB.")
         self._status.set(f"RDB restored from {os.path.basename(path)}. Re-select disk to refresh.")
 
+    # ── ERDB extended backup / restore ──────────────────────────────────────────
+    # Format (compatible with DiskPart):
+    #   32-byte header: 8 × big-endian uint32
+    #     [0] magic  = 0x45524442 ('ERDB')
+    #     [1] version = 1
+    #     [2] block_lo
+    #     [3] block_size (512)
+    #     [4] num_blocks
+    #     [5..7] reserved (0)
+    #   Then num_blocks × 512 bytes of raw block data.
+
+    _ERDB_MAGIC   = 0x45524442
+    _ERDB_VERSION = 1
+    _ERDB_HDR_SZ  = 32
+
+    def _do_backup_rdb_extended(self):
+        if not self._rdb or not self._rdb.valid:
+            messagebox.showerror("No RDB", "Load a disk with a valid RDB first.",
+                                 parent=self); return
+        if not self._cur_disk:
+            messagebox.showerror("No Disk Selected", "Select a disk first.",
+                                 parent=self); return
+        dev      = self._cur_disk["path"]
+        block_lo = self._rdb.rdbblock_lo
+        block_hi = self._rdb.rdbblock_hi
+        num_blocks = block_hi - block_lo + 1
+
+        model = (self._cur_disk.get("model") or "disk").strip()
+        safe  = re.sub(r"[^A-Za-z0-9_-]", "_", model).strip("_") or "disk"
+        suggested = f"RDB_extended_{safe}.backup"
+
+        path = filedialog.asksaveasfilename(
+            title="Save Extended RDB Backup",
+            defaultextension=".backup",
+            initialfile=suggested,
+            filetypes=[("ERDB backup", "*.backup"), ("All files", "*.*")],
+            parent=self)
+        if not path:
+            return
+
+        hdr = struct.pack(">8I",
+            self._ERDB_MAGIC, self._ERDB_VERSION,
+            block_lo, 512, num_blocks, 0, 0, 0)
+        try:
+            with open(path, "wb") as f:
+                f.write(hdr)
+                for blk in range(block_lo, block_hi + 1):
+                    data = _read_block(dev, blk)
+                    if data is None:
+                        messagebox.showerror("Read Error",
+                            f"Failed to read block {blk} from {dev}.", parent=self)
+                        return
+                    f.write(data)
+        except OSError as e:
+            messagebox.showerror("Save Error", str(e), parent=self); return
+
+        messagebox.showinfo("Extended Backup Complete",
+            f"Extended RDB backup saved.\n"
+            f"{num_blocks} blocks (blocks {block_lo}–{block_hi})\n\n"
+            f"{path}", parent=self)
+        self._status.set(f"Extended RDB backup saved: {os.path.basename(path)}")
+
+    def _do_restore_rdb_extended(self):
+        if not self._cur_disk:
+            messagebox.showerror("No Disk Selected", "Select a disk first.",
+                                 parent=self); return
+        dev = self._cur_disk["path"]
+
+        if not messagebox.askyesno("Extended Restore — WARNING",
+                "WARNING: This will overwrite multiple blocks\n"
+                "(RDB, partitions, filesystems) on the disk!\n\n"
+                "An incorrect backup WILL destroy the disk layout.\n"
+                "Ensure the backup matches THIS disk.\n\n"
+                "Are you absolutely sure?",
+                icon="warning", parent=self):
+            return
+
+        path = filedialog.askopenfilename(
+            title="Select Extended RDB Backup File",
+            filetypes=[("ERDB backup", "*.backup"), ("All files", "*.*")],
+            parent=self)
+        if not path:
+            return
+
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError as e:
+            messagebox.showerror("Open Error", str(e), parent=self); return
+
+        if len(raw) < self._ERDB_HDR_SZ:
+            messagebox.showerror("Invalid File",
+                "File too small — not a valid extended backup.", parent=self); return
+
+        magic, version, block_lo, block_size, num_blocks = struct.unpack_from(">5I", raw)
+        if magic != self._ERDB_MAGIC or version != self._ERDB_VERSION:
+            messagebox.showerror("Invalid File",
+                "Not a valid extended RDB backup.\n(Bad magic or unsupported version.)",
+                parent=self); return
+        if block_size != 512:
+            messagebox.showerror("Invalid File",
+                f"Block size mismatch: backup uses {block_size}-byte blocks, "
+                "this tool requires 512.", parent=self); return
+        expected = self._ERDB_HDR_SZ + num_blocks * 512
+        if len(raw) != expected:
+            messagebox.showerror("Invalid File",
+                "File size does not match header — backup may be corrupt.",
+                parent=self); return
+
+        if not messagebox.askyesno("LAST CHANCE",
+                f"Write {num_blocks} block(s) "
+                f"(blocks {block_lo}–{block_lo + num_blocks - 1}) to:\n\n"
+                f"  {dev}   ({fmt_size(self._cur_disk['size'])})\n\n"
+                "This CANNOT be undone.",
+                icon="warning", parent=self):
+            return
+
+        if not os.access(dev, os.W_OK):
+            messagebox.showerror("Permission Denied",
+                f"Cannot write to {dev}.\n\nRun this program with sudo.",
+                parent=self); return
+
+        offset = self._ERDB_HDR_SZ
+        for i in range(num_blocks):
+            blk_data = raw[offset + i * 512 : offset + i * 512 + 512]
+            if not _write_block(dev, block_lo + i, blk_data):
+                messagebox.showerror("Write Error",
+                    f"Failed to write block {block_lo + i} to {dev}.", parent=self)
+                return
+
+        messagebox.showinfo("Extended Restore Complete",
+            "Extended RDB restored successfully.\n\n"
+            "Re-select the disk to reload the RDB.", parent=self)
+        self._status.set(
+            f"Extended RDB restored from {os.path.basename(path)}. Re-select disk to refresh.")
+
     def _do_image_disk(self):
         if not self._cur_disk:
             messagebox.showerror("No Disk Selected", "Select a disk first.")
@@ -2514,6 +3954,76 @@ class App(tk.Tk):
             messagebox.showinfo("Restore Complete",
                 f"Image restored to {dev}.\n\nRe-select the disk to reload.")
             self._status.set(f"Image restored to {dev}. Re-select disk to refresh.")
+
+    def _do_move(self):
+        sel = self._ptree.selection()
+        if not sel or not self._rdb or not self._cur_disk:
+            return
+        idx = int(sel[0])
+        pi  = self._rdb.partitions[idx]
+        dev = self._cur_disk["path"]
+        dlg = MovePartitionDialog(self, dev, self._rdb, pi)
+        if dlg.result is not None:
+            new_lo  = dlg.result
+            cyl_cnt = pi.high_cyl - pi.low_cyl + 1
+            pi.low_cyl  = new_lo
+            pi.high_cyl = new_lo + cyl_cnt - 1
+            self._refresh_parts()
+            self._draw_map()
+            self._status.set(
+                f"Partition '{pi.drive_name}' moved to cyl {pi.low_cyl}\u2013{pi.high_cyl}. "
+                "Write to disk to update the RDB.")
+
+    def _do_grow(self):
+        sel = self._ptree.selection()
+        if not sel or not self._rdb or not self._cur_disk:
+            return
+        idx = int(sel[0])
+        pi  = self._rdb.partitions[idx]
+        dev = self._cur_disk["path"]
+        dlg = GrowPartitionDialog(self, self._rdb, pi)
+        if dlg.result is None:
+            return
+        new_hi = dlg.result
+        old_hi = pi.high_cyl
+        pi.high_cyl = new_hi
+        self._refresh_parts()
+        self._draw_map()
+
+        if _ffs_is_type(pi.dos_type):
+            if messagebox.askyesno("Grow FFS Filesystem",
+                    f"Partition {pi.drive_name} extended to cyl {new_hi}.\n\n"
+                    "EXPERIMENTAL: Grow the FFS filesystem to match?\n\n"
+                    "This writes FFS bitmap blocks directly to disk.\n"
+                    "Always have a backup before proceeding.",
+                    parent=self, icon="warning"):
+                ok, msg = _ffs_grow(dev, self._rdb, pi, old_hi)
+                if ok:
+                    messagebox.showinfo("FFS Grown",
+                        f"FFS filesystem grown successfully.\n\n{msg}\n\n"
+                        "Write RDB to disk, then reboot.", parent=self)
+                else:
+                    messagebox.showerror("FFS Grow Failed",
+                        f"FFS grow failed:\n{msg}", parent=self)
+
+        elif _pfs_is_type(pi.dos_type):
+            if messagebox.askyesno("Grow PFS Filesystem",
+                    f"Partition {pi.drive_name} extended to cyl {new_hi}.\n\n"
+                    "EXPERIMENTAL: Grow the PFS filesystem to match?\n\n"
+                    "This updates PFS rootblock metadata on disk.",
+                    parent=self, icon="warning"):
+                ok, msg = _pfs_grow(dev, self._rdb, pi, old_hi)
+                if ok:
+                    messagebox.showinfo("PFS Grown",
+                        f"PFS filesystem grown successfully.\n\n{msg}\n\n"
+                        "Write RDB to disk, then reboot.", parent=self)
+                else:
+                    messagebox.showerror("PFS Grow Failed",
+                        f"PFS grow failed:\n{msg}", parent=self)
+
+        self._status.set(
+            f"Partition '{pi.drive_name}' grown to cyl {new_hi}. "
+            "Write to disk to save.")
 
     def _about(self):
         messagebox.showinfo("About AmigaDisk",
