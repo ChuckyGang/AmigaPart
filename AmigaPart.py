@@ -1514,13 +1514,20 @@ class AddPartitionDialog(tk.Toplevel):
                  preset_lo: int = None, preset_hi: int = None):
         super().__init__(parent)
         self.title("Add Partition")
-        self.resizable(False, False)
+        self.resizable(False, True)
         self.grab_set()
         self.result: Optional[PartitionInfo] = None
         self._rdb = rdb
         self._preset_lo = preset_lo
         self._preset_hi = preset_hi
         self._build()
+        self.update_idletasks()
+        dw = self.winfo_reqwidth(); dh = self.winfo_reqheight()
+        sh = self.winfo_screenheight()
+        dh = min(dh, sh - 80)
+        pw = parent.winfo_width();  ph = parent.winfo_height()
+        px = parent.winfo_rootx(); py = parent.winfo_rooty()
+        self.geometry(f"{dw}x{dh}+{px + (pw - dw)//2}+{py + (ph - dh)//2}")
         self.transient(parent)
         self.wait_window()
 
@@ -1544,8 +1551,14 @@ class AddPartitionDialog(tk.Toplevel):
         return candidate, self._rdb.hicyl
 
     def _build(self):
+        # ── Button bar packed first so it's always visible at bottom ──────────
+        bf = tk.Frame(self)
+        bf.pack(side="bottom", fill="x", pady=(4, 8))
+        tk.Button(bf, text="Add",    width=10, command=self._ok).pack(side="left", padx=4)
+        tk.Button(bf, text="Cancel", width=10, command=self.destroy).pack(side="left", padx=4)
+
         f = tk.Frame(self, padx=12, pady=10)
-        f.pack(fill="both", expand=True)
+        f.pack(side="top", fill="both", expand=True)
         row = 0
 
         free_lo, free_hi = self._find_free()
@@ -1578,7 +1591,7 @@ class AddPartitionDialog(tk.Toplevel):
 
         flag_frame = tk.Frame(f, relief="groove", bd=2)
         flag_frame.grid(row=row, columnspan=2, sticky="ew", pady=(4, 2)); row += 1
-        self._bootable_var   = tk.BooleanVar(value=len(rdb.partitions) == 0)
+        self._bootable_var   = tk.BooleanVar(value=len(self._rdb.partitions) == 0)
         self._automount_var  = tk.BooleanVar(value=True)
         self._directscsi_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(flag_frame, text=" Bootable ",
@@ -1655,11 +1668,6 @@ class AddPartitionDialog(tk.Toplevel):
             row=2, column=1, sticky="w", padx=(0, 12), pady=2)
 
         self._adv_frame.grid_remove()
-
-        bf = tk.Frame(f)
-        bf.grid(row=row, columnspan=2, pady=(8,0))
-        tk.Button(bf, text="Add",    width=10, command=self._ok).pack(side="left", padx=4)
-        tk.Button(bf, text="Cancel", width=10, command=self.destroy).pack(side="left", padx=4)
 
     def _toggle_adv(self):
         if self._adv_var.get():
@@ -1745,7 +1753,7 @@ class EditPartitionDialog(tk.Toplevel):
         super().__init__(parent)
         self.transient(parent)
         self.title("Edit Partition")
-        self.resizable(False, False)
+        self.resizable(False, True)
         self.result: Optional[PartitionInfo] = None
         self._rdb      = rdb
         self._idx      = part_idx
@@ -1756,7 +1764,9 @@ class EditPartitionDialog(tk.Toplevel):
         pw = parent.winfo_width();  ph = parent.winfo_height()
         px = parent.winfo_rootx(); py = parent.winfo_rooty()
         dw = self.winfo_reqwidth(); dh = self.winfo_reqheight()
-        self.geometry(f"+{px + (pw - dw)//2}+{py + (ph - dh)//2}")
+        sh = self.winfo_screenheight()
+        dh = min(dh, sh - 80)
+        self.geometry(f"{dw}x{dh}+{px + (pw - dw)//2}+{py + (ph - dh)//2}")
         self.wait_visibility()
         self.grab_set()
         self.wait_window()
@@ -1775,8 +1785,14 @@ class EditPartitionDialog(tk.Toplevel):
         return min_lo, max_hi
 
     def _build(self):
+        # ── Button bar packed first so it's always visible at bottom ──────────
+        bf = tk.Frame(self)
+        bf.pack(side="bottom", fill="x", pady=(4, 8))
+        tk.Button(bf, text="Save",   width=10, command=self._ok).pack(side="left", padx=4)
+        tk.Button(bf, text="Cancel", width=10, command=self.destroy).pack(side="left", padx=4)
+
         f = tk.Frame(self, padx=12, pady=10)
-        f.pack(fill="both", expand=True)
+        f.pack(side="top", fill="both", expand=True)
         row = 0
 
         p = self._orig
@@ -1914,11 +1930,6 @@ class EditPartitionDialog(tk.Toplevel):
             row=2, column=1, sticky="w", padx=(0, 12), pady=2)
 
         self._adv_frame.grid_remove()
-
-        bf = tk.Frame(f)
-        bf.grid(row=row, columnspan=2, pady=(8, 0))
-        tk.Button(bf, text="Save",   width=10, command=self._ok).pack(side="left", padx=4)
-        tk.Button(bf, text="Cancel", width=10, command=self.destroy).pack(side="left", padx=4)
 
     def _toggle_adv(self):
         if self._adv_var.get():
