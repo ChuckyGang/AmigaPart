@@ -42,15 +42,17 @@ BUFMEMTYPE_OPTS = [
     ("Fast RAM (4)",  4),
 ]
 
-# SizeBlock: filesystem block size in longwords (bytes / 4)
+# Filesystem block size options, mapped to FS block size in BYTES.
+# Save convention: pi.size_block = 128 (device sector = 512 bytes)
+# and pi.secs_per_blk = fs_bsz // 512 (DE_SECSPERBLK).
 SIZEBLOCK_OPTS = [
-    ("512 B",   128),
-    ("1 KB",    256),
-    ("2 KB",    512),
-    ("4 KB",   1024),
-    ("8 KB",   2048),
-    ("16 KB",  4096),
-    ("32 KB",  8192),
+    ("512 B",    512),
+    ("1 KB",    1024),
+    ("2 KB",    2048),
+    ("4 KB",    4096),
+    ("8 KB",    8192),
+    ("16 KB",  16384),
+    ("32 KB",  32768),
 ]
 
 
@@ -224,10 +226,9 @@ def _ffs_is_type(dos_type: int) -> bool:
     return (dos_type & 0xFFFFFF00) == 0x444F5300 and (dos_type & 0xFF) <= 7
 
 def _ffs_checksum(buf: bytes, nlongs: int) -> int:
-    """FFS block checksum value: -(sum of all longs) & 0xFFFFFFFF."""
-    s = 0
-    for i in range(nlongs):
-        s = (s + struct.unpack_from(">I", buf, i * 4)[0]) & 0xFFFFFFFF
+    """FFS block checksum value: -(sum of all longs) & 0xFFFFFFFF.
+    Vectorised: a single struct.unpack of N big-endian longs."""
+    s = sum(struct.unpack(f">{nlongs}I", bytes(buf[:nlongs * 4])))
     return (-s) & 0xFFFFFFFF
 
 def _bm_setfree(buf: bytearray, off: int):
@@ -495,17 +496,32 @@ def _part_can_grow(rdb, pi, new_hi: int):
     return (True,)
 
 # ── FFS filesystem grow ─────────────────────────────────────────────────────────
+#
+# All FFS-internal block numbers (root_blk, bm_pages[], bm_ext, fhb_HashChain,
+# etc.) are FS-block numbers relative to the partition start.  One FS-block
+# read/write turns into `spb` consecutive device-block I/Os via the
+# read_fs_block / write_fs_block helpers.  Translation:
+#     device_blk_for(fs_blk) = part_abs + fs_blk * spb
+# All offsets into the root block (bm_flag, bm_pages start, bm_ext, parent,
+# sec_type, ht_size) are derived from nlongs at runtime — so the same code
+# handles 512-, 1024-, 4096-byte FS blocks.
 
 _FFS_ROOT_BM_MAX   = 25
-_FFS_EXT_BM_MAX    = 127
 _FFS_MAX_EXT_CHAIN = 32
 _FFS_RL_CHKSUM     = 5
-_FFS_RL_BM_FLAG    = 78
-_FFS_RL_BM_PAGES   = 79   # root_buf[79..103] = 25 bitmap block pointers
-_FFS_RL_BM_EXT     = 104
 _FFS_T_SHORT       = 2
 _FFS_ST_ROOT       = 1
 _FFS_BM_VALID      = 0xFFFFFFFF
+
+# Root-block long-word offsets, parameterised on nlongs (eff_bsz/4).
+def _FFS_HT_SIZE  (nl): return nl - 56   # hash table entry count (72 / 200)
+def _FFS_RL_BM_FLAG (nl): return nl - 50 # bm_flag         (78 / 206)
+def _FFS_RL_BM_PAGES(nl): return nl - 49 # bm_pages[] start (79 / 207)
+def _FFS_RL_BM_EXT  (nl): return nl - 24 # bm_ext          (104 / 232)
+def _FFS_RL_PARENT  (nl): return nl - 3  # rb_Parent       (125 / 253)
+def _FFS_RL_SEC_TYPE(nl): return nl - 1  # sec_type        (127 / 255)
+# Slots per bm_ext block; last long = next ext block ptr.
+def _FFS_EXT_BM_MAX (nl): return nl - 1
 
 
 def _ffs_grow(dev: str, rdb, pi, old_hi: int, progress_cb=None) -> tuple:
@@ -515,298 +531,383 @@ def _ffs_grow(dev: str, rdb, pi, old_hi: int, progress_cb=None) -> tuple:
 
     heads   = pi.surfaces    or rdb.heads
     sectors = pi.blk_per_trk or rdb.sectors
-    nlongs  = 128   # 512 bytes / 4
-    eff_bsz = 512
 
     if not heads or not sectors:
         return False, f"Invalid geometry (heads={heads}, sectors={sectors})."
 
-    part_abs   = pi.low_cyl  * heads * sectors
-    old_blocks = (old_hi      - pi.low_cyl + 1) * heads * sectors
-    new_blocks = (pi.high_cyl - pi.low_cyl + 1) * heads * sectors
-    reserved   = pi.reserved if pi.reserved > 0 else 2
-    bpbm       = (nlongs - 1) * 32   # 127 * 32 = 4064 blocks per bitmap block
+    # Device sector (DE_SIZEBLOCK*4 — must be 512 for our 512-byte _read_block)
+    dev_bsz = pi.size_block * 4 if pi.size_block > 0 else 512
+    spb     = pi.secs_per_blk if pi.secs_per_blk > 0 else 1
+    eff_bsz = dev_bsz * spb
+    nlongs  = eff_bsz // 4
+
+    if dev_bsz != 512:
+        return False, (f"Only 512-byte device sectors supported (got {dev_bsz}).\n"
+                       "Set DE_SIZEBLOCK = 128 and fold the multiplier into "
+                       "DE_SECSPERBLK instead.")
+    if eff_bsz < 512 or eff_bsz > 16384 or (eff_bsz & (eff_bsz - 1)):
+        return False, (f"Unsupported FS block size {eff_bsz} (spb={spb}).\n"
+                       "Must be a power of two in 512..16384.")
+
+    part_abs       = pi.low_cyl  * heads * sectors
+    old_dev_blocks = (old_hi      - pi.low_cyl + 1) * heads * sectors
+    new_dev_blocks = (pi.high_cyl - pi.low_cyl + 1) * heads * sectors
+    # FFS rounds down: HighestBlock = total/spb - 1.  All chain values below
+    # use FS-block units.
+    old_blocks     = old_dev_blocks // spb
+    new_blocks     = new_dev_blocks // spb
+    reserved       = pi.reserved if pi.reserved > 0 else 2
+    bpbm           = (nlongs - 1) * 32   # 4064 for 512-byte FS, 8160 for 1024
+    ext_slots      = _FFS_EXT_BM_MAX(nlongs)
 
     def prog(msg):
         if progress_cb:
             progress_cb(msg)
 
-    def read_blk(abs_blk):
-        d = _read_block(dev, abs_blk)
-        return bytearray(d) if d else None
+    # Open the device once for the duration of the grow.  The previous
+    # implementation re-opened the file (and fsync'd) on every block, which
+    # made a multi-GB grow take minutes — on a 4 GB partition that meant
+    # ~500 bitmap-block writes × 2 device sectors (spb=2 for 1024-byte FFS)
+    # × open/seek/write/fsync syscalls each.  One open + one fsync at the
+    # end turns minutes into seconds.
+    try:
+        _f = open(dev, "r+b", buffering=0)
+    except OSError as e:
+        return False, f"Cannot open '{dev}': {e}"
 
-    def write_blk(abs_blk, buf):
-        return _write_block(dev, abs_blk, bytes(buf) if isinstance(buf, bytearray) else buf)
+    def read_blk(fs_blk):
+        try:
+            _f.seek((part_abs + fs_blk * spb) * 512)
+            d = _f.read(eff_bsz)
+            return bytearray(d) if len(d) == eff_bsz else None
+        except OSError:
+            return None
 
-    if old_blocks <= reserved or new_blocks <= reserved:
-        return False, (f"Partition too small (old_blocks={old_blocks}, "
-                       f"new_blocks={new_blocks}, reserved={reserved}).")
+    def write_blk(fs_blk, buf):
+        try:
+            _f.seek((part_abs + fs_blk * spb) * 512)
+            _f.write(bytes(buf) if isinstance(buf, bytearray) else buf)
+            return True
+        except OSError:
+            return False
 
-    # FFS BitmapCount formula (from init.asm):
-    # BitmapCount = (bpbm - 2 + HighestBlock - reserved) / bpbm
-    old_bm_need = (bpbm - 2 + old_blocks - reserved) // bpbm
-    new_bm_need = (bpbm - 2 + new_blocks - reserved) // bpbm
-    num_new_bm  = new_bm_need - old_bm_need
+    try:
 
-    # Phase 1: read + validate boot block
-    prog("Reading boot block...")
-    boot_buf = read_blk(part_abs)
-    if not boot_buf:
-        return False, f"Cannot read boot block (abs {part_abs})."
-    if (struct.unpack_from(">I", boot_buf, 0)[0] & 0xFFFFFF00) != 0x444F5300:
-        return False, "Boot block DosType mismatch."
-    root_blk_stored = struct.unpack_from(">I", boot_buf, 8)[0]   # L[2] = bb[2]
-    root_blk = root_blk_stored
-    if root_blk == 0 or root_blk >= old_blocks:
-        root_blk = old_blocks // 2
+        if old_blocks <= reserved or new_blocks <= reserved:
+            return False, (f"Partition too small (old_blocks={old_blocks}, "
+                           f"new_blocks={new_blocks}, reserved={reserved}).")
 
-    # Phase 2: read + validate root block
-    prog("Reading root block...")
-    root_buf = read_blk(part_abs + root_blk)
-    if not root_buf:
-        return False, f"Cannot read root block (abs {part_abs + root_blk}, rel {root_blk})."
-    if (struct.unpack_from(">I", root_buf, 0)[0] != _FFS_T_SHORT or
-            struct.unpack_from(">I", root_buf, (nlongs - 1) * 4)[0] != _FFS_ST_ROOT):
-        return False, (f"Root block wrong type/sec_type "
-                       f"({struct.unpack_from('>I', root_buf, 0)[0]:#010x}/"
-                       f"{struct.unpack_from('>I', root_buf, (nlongs-1)*4)[0]:#010x}).")
-    save_cs = struct.unpack_from(">I", root_buf, _FFS_RL_CHKSUM * 4)[0]
-    struct.pack_into(">I", root_buf, _FFS_RL_CHKSUM * 4, 0)
-    calc_cs = _ffs_checksum(bytes(root_buf), nlongs)
-    struct.pack_into(">I", root_buf, _FFS_RL_CHKSUM * 4, save_cs)
-    if calc_cs != save_cs:
-        return False, f"Root block checksum invalid (stored {save_cs:#010x}, calc {calc_cs:#010x})."
-    if struct.unpack_from(">I", root_buf, _FFS_RL_BM_FLAG * 4)[0] != _FFS_BM_VALID:
-        return False, "Bitmap not valid in root block (filesystem may need DiskSalv)."
+        # FFS BitmapCount formula (from init.asm):
+        # BitmapCount = (bpbm - 2 + HighestBlock - reserved) / bpbm
+        old_bm_need = (bpbm - 2 + old_blocks - reserved) // bpbm
+        new_bm_need = (bpbm - 2 + new_blocks - reserved) // bpbm
+        num_new_bm  = new_bm_need - old_bm_need
 
-    # Phase 3: collect existing bitmap block numbers from root + ext chain
-    prog("Reading bitmap chain...")
-    bm_blknums = []
-    ext_chain  = []   # list of (relblk, used_count)
+        # Pre-resolved root-block field offsets for this nlongs.
+        RL_BM_FLAG  = _FFS_RL_BM_FLAG(nlongs)
+        RL_BM_PAGES = _FFS_RL_BM_PAGES(nlongs)
+        RL_BM_EXT   = _FFS_RL_BM_EXT(nlongs)
+        RL_PARENT   = _FFS_RL_PARENT(nlongs)
+        RL_SEC_TYPE = _FFS_RL_SEC_TYPE(nlongs)
+        HT_SIZE     = _FFS_HT_SIZE(nlongs)
 
-    for i in range(_FFS_ROOT_BM_MAX):
-        v = struct.unpack_from(">I", root_buf, (_FFS_RL_BM_PAGES + i) * 4)[0]
-        if v == 0:
-            break
-        bm_blknums.append(v)
+        # Phase 1: read + validate boot block (FS-block 0)
+        prog("Reading boot block...")
+        boot_buf = read_blk(0)
+        if not boot_buf:
+            return False, f"Cannot read boot block (abs {part_abs})."
+        if (struct.unpack_from(">I", boot_buf, 0)[0] & 0xFFFFFF00) != 0x444F5300:
+            return False, "Boot block DosType mismatch."
+        root_blk_stored = struct.unpack_from(">I", boot_buf, 8)[0]   # L[2] = bb[2]
+        root_blk = root_blk_stored
+        if root_blk == 0 or root_blk >= old_blocks:
+            root_blk = old_blocks // 2
 
-    ext_blk = struct.unpack_from(">I", root_buf, _FFS_RL_BM_EXT * 4)[0]
-    while ext_blk != 0 and len(ext_chain) < _FFS_MAX_EXT_CHAIN:
-        eb = read_blk(part_abs + ext_blk)
-        if not eb:
-            break
-        used = 0
-        for i in range(_FFS_EXT_BM_MAX):
-            v = struct.unpack_from(">I", eb, i * 4)[0]
+        # Phase 2: read + validate root block
+        prog("Reading root block...")
+        root_buf = read_blk(root_blk)
+        if not root_buf:
+            return False, (f"Cannot read root block "
+                           f"(abs {part_abs + root_blk * spb}, fs_blk {root_blk}).")
+        if (struct.unpack_from(">I", root_buf, 0)[0] != _FFS_T_SHORT or
+                struct.unpack_from(">I", root_buf, RL_SEC_TYPE * 4)[0] != _FFS_ST_ROOT):
+            return False, (f"Root block wrong type/sec_type "
+                           f"({struct.unpack_from('>I', root_buf, 0)[0]:#010x}/"
+                           f"{struct.unpack_from('>I', root_buf, RL_SEC_TYPE * 4)[0]:#010x}) "
+                           f"part_abs={part_abs} bb[2]={root_blk_stored} "
+                           f"root_blk={root_blk} old_blks={old_blocks} spb={spb}.")
+        save_cs = struct.unpack_from(">I", root_buf, _FFS_RL_CHKSUM * 4)[0]
+        struct.pack_into(">I", root_buf, _FFS_RL_CHKSUM * 4, 0)
+        calc_cs = _ffs_checksum(bytes(root_buf), nlongs)
+        struct.pack_into(">I", root_buf, _FFS_RL_CHKSUM * 4, save_cs)
+        if calc_cs != save_cs:
+            return False, f"Root block checksum invalid (stored {save_cs:#010x}, calc {calc_cs:#010x})."
+        if struct.unpack_from(">I", root_buf, RL_BM_FLAG * 4)[0] != _FFS_BM_VALID:
+            return False, "Bitmap not valid in root block (filesystem may need DiskSalv)."
+
+        # Phase 3: collect existing bitmap block numbers from root + ext chain
+        prog("Reading bitmap chain...")
+        bm_blknums = []
+        ext_chain  = []   # list of (relblk, used_count)
+
+        for i in range(_FFS_ROOT_BM_MAX):
+            v = struct.unpack_from(">I", root_buf, (RL_BM_PAGES + i) * 4)[0]
             if v == 0:
                 break
-            used += 1
             bm_blknums.append(v)
-        ext_chain.append((ext_blk, used))
-        ext_blk = struct.unpack_from(">I", eb, (nlongs - 1) * 4)[0]
 
-    if len(bm_blknums) < old_bm_need:
-        return False, (f"Bitmap chain has {len(bm_blknums)} blocks, "
-                       f"expected at least {old_bm_need}.")
+        ext_blk = struct.unpack_from(">I", root_buf, RL_BM_EXT * 4)[0]
+        while ext_blk != 0 and len(ext_chain) < _FFS_MAX_EXT_CHAIN:
+            eb = read_blk(ext_blk)
+            if not eb:
+                break
+            used = 0
+            for i in range(ext_slots):
+                v = struct.unpack_from(">I", eb, i * 4)[0]
+                if v == 0:
+                    break
+                used += 1
+                bm_blknums.append(v)
+            ext_chain.append((ext_blk, used))
+            ext_blk = struct.unpack_from(">I", eb, (nlongs - 1) * 4)[0]
 
-    # Phase 4: check available chain capacity for new bm pointers
-    root_free     = max(0, _FFS_ROOT_BM_MAX - len(bm_blknums))
-    last_ext_free = (_FFS_EXT_BM_MAX - ext_chain[-1][1]) if ext_chain else 0
-    avail_slots   = root_free + last_ext_free
+        if len(bm_blknums) < old_bm_need:
+            return False, (f"Bitmap chain has {len(bm_blknums)} blocks, "
+                           f"expected at least {old_bm_need}.")
 
-    new_ext_relblks = []
-    if num_new_bm > avail_slots:
-        overflow    = num_new_bm - avail_slots
-        num_new_ext = (overflow + _FFS_EXT_BM_MAX - 1) // _FFS_EXT_BM_MAX
-        if num_new_ext > _FFS_MAX_EXT_CHAIN:
-            return False, (f"Grow requires {num_new_ext} new ext blocks "
-                           f"(max {_FFS_MAX_EXT_CHAIN}).")
-        for ei in range(num_new_ext):
-            pos = reserved + (new_bm_need - 1) * bpbm + 1 + ei
-            if pos >= new_blocks:
-                return False, f"No room in new partition space for ext block {ei}."
-            new_ext_relblks.append(pos)
+        # Phase 4: check available chain capacity for new bm pointers
+        root_free     = max(0, _FFS_ROOT_BM_MAX - len(bm_blknums))
+        last_ext_free = (ext_slots - ext_chain[-1][1]) if ext_chain else 0
+        avail_slots   = root_free + last_ext_free
 
-    # Phase 5: update last existing bitmap block to cover newly-available blocks
-    prog("Extending last bitmap block...")
-    if old_bm_need > 0:
-        bm_idx    = old_bm_need - 1
-        range_end = reserved + old_bm_need * bpbm
-        free_end  = min(range_end, new_blocks)
-        if old_blocks < free_end:
-            bm_buf = read_blk(part_abs + bm_blknums[bm_idx])
-            if not bm_buf:
-                return False, f"Cannot read last bm block {bm_blknums[bm_idx]}."
-            for b in range(old_blocks, free_end):
-                _bm_setfree(bm_buf, b - reserved - bm_idx * bpbm)
+        new_ext_relblks = []
+        if num_new_bm > avail_slots:
+            overflow    = num_new_bm - avail_slots
+            num_new_ext = (overflow + ext_slots - 1) // ext_slots
+            if num_new_ext > _FFS_MAX_EXT_CHAIN:
+                return False, (f"Grow requires {num_new_ext} new ext blocks "
+                               f"(max {_FFS_MAX_EXT_CHAIN}).")
+            for ei in range(num_new_ext):
+                pos = reserved + (new_bm_need - 1) * bpbm + 1 + ei
+                if pos >= new_blocks:
+                    return False, f"No room in new partition space for ext block {ei}."
+                new_ext_relblks.append(pos)
+
+        # Phase 5: update last existing bitmap block to cover newly-available blocks
+        prog("Extending last bitmap block...")
+        if old_bm_need > 0:
+            bm_idx    = old_bm_need - 1
+            range_end = reserved + old_bm_need * bpbm
+            free_end  = min(range_end, new_blocks)
+            if old_blocks < free_end:
+                bm_buf = read_blk(bm_blknums[bm_idx])
+                if not bm_buf:
+                    return False, f"Cannot read last bm block {bm_blknums[bm_idx]}."
+                for b in range(old_blocks, free_end):
+                    _bm_setfree(bm_buf, b - reserved - bm_idx * bpbm)
+                struct.pack_into(">I", bm_buf, 0, 0)
+                struct.pack_into(">I", bm_buf, 0, _ffs_checksum(bytes(bm_buf), nlongs))
+                if not write_blk(bm_blknums[bm_idx], bm_buf):
+                    return False, f"Failed to write updated bm block {bm_blknums[bm_idx]}."
+
+        # Phase 6: create new bitmap blocks for the extended range
+        prog(f"Writing {num_new_bm} new bitmap blocks...")
+        # Pre-built "all free" template (every bit = 1).  For the common case
+        # where a new bm block covers its full bpbm range, we copy this once
+        # instead of running bpbm iterations of _bm_setfree (8160 for
+        # 1024-byte FS — millions of Python iterations otherwise).
+        _all_free = bytes([0xFF]) * eff_bsz
+        for k in range(num_new_bm):
+            bm_idx  = old_bm_need + k
+            abs_blk = reserved + bm_idx * bpbm
+            b_start = reserved + bm_idx * bpbm
+            b_end   = min(reserved + (bm_idx + 1) * bpbm, new_blocks)
+            bm_blknums.append(abs_blk)
+
+            if b_end - b_start == bpbm:
+                # Full coverage — start from the all-1s template.
+                bm_buf = bytearray(_all_free)
+            else:
+                # Tail bm block whose coverage range is truncated by the new
+                # partition size — only the actual range is marked free.
+                bm_buf = bytearray(eff_bsz)
+                for b in range(b_start, b_end):
+                    _bm_setfree(bm_buf, b - b_start)
+            _bm_setused(bm_buf, 0)   # the bm block itself is at abs_blk = b_start
+            for ep in new_ext_relblks:
+                if b_start <= ep < b_end:
+                    _bm_setused(bm_buf, ep - b_start)
             struct.pack_into(">I", bm_buf, 0, 0)
             struct.pack_into(">I", bm_buf, 0, _ffs_checksum(bytes(bm_buf), nlongs))
-            if not write_blk(part_abs + bm_blknums[bm_idx], bm_buf):
-                return False, f"Failed to write updated bm block {bm_blknums[bm_idx]}."
+            if not write_blk(abs_blk, bm_buf):
+                return False, (f"Failed to write new bm block {abs_blk} "
+                               f"(abs {part_abs + abs_blk * spb}).")
+            if (k & 0x1F) == 0x1F:
+                prog(f"Writing bitmap blocks... {k + 1}/{num_new_bm}")
 
-    # Phase 6: create new bitmap blocks for the extended range
-    prog("Writing new bitmap blocks...")
-    for k in range(num_new_bm):
-        bm_idx  = old_bm_need + k
-        abs_blk = reserved + bm_idx * bpbm
-        b_start = reserved + bm_idx * bpbm
-        b_end   = min(reserved + (bm_idx + 1) * bpbm, new_blocks)
-        bm_blknums.append(abs_blk)
+        # Phase 7: add new bm block numbers to the pointer chain
+        prog("Updating bitmap chain in root...")
+        src_idx = old_bm_need
+        added   = 0
 
-        bm_buf = bytearray(eff_bsz)
-        for b in range(b_start, b_end):
-            _bm_setfree(bm_buf, b - b_start)
-        _bm_setused(bm_buf, 0)   # the bm block itself is at abs_blk = b_start
-        for ep in new_ext_relblks:
-            if b_start <= ep < b_end:
-                _bm_setused(bm_buf, ep - b_start)
-        struct.pack_into(">I", bm_buf, 0, 0)
-        struct.pack_into(">I", bm_buf, 0, _ffs_checksum(bytes(bm_buf), nlongs))
-        if not write_blk(part_abs + abs_blk, bm_buf):
-            return False, f"Failed to write new bm block {abs_blk} (abs {part_abs + abs_blk})."
+        i = old_bm_need
+        while i < _FFS_ROOT_BM_MAX and added < num_new_bm:
+            struct.pack_into(">I", root_buf, (RL_BM_PAGES + i) * 4, bm_blknums[src_idx])
+            i += 1; added += 1; src_idx += 1
 
-    # Phase 7: add new bm block numbers to the pointer chain
-    prog("Updating bitmap chain in root...")
-    src_idx = old_bm_need
-    added   = 0
+        if added < num_new_bm and ext_chain:
+            last_ext_blk, last_ext_used = ext_chain[-1]
+            eb = read_blk(last_ext_blk)
+            if not eb:
+                return False, f"Cannot re-read last ext block {last_ext_blk}."
+            slot = last_ext_used
+            while slot < ext_slots and added < num_new_bm:
+                struct.pack_into(">I", eb, slot * 4, bm_blknums[src_idx])
+                slot += 1; added += 1; src_idx += 1
+            struct.pack_into(">I", eb, (nlongs - 1) * 4,
+                             new_ext_relblks[0] if new_ext_relblks else 0)
+            if not write_blk(last_ext_blk, eb):
+                return False, f"Failed to write updated ext block {last_ext_blk}."
 
-    i = old_bm_need
-    while i < _FFS_ROOT_BM_MAX and added < num_new_bm:
-        struct.pack_into(">I", root_buf, (_FFS_RL_BM_PAGES + i) * 4, bm_blknums[src_idx])
-        i += 1; added += 1; src_idx += 1
+        for ei, ep in enumerate(new_ext_relblks):
+            eb   = bytearray(eff_bsz)
+            slot = 0
+            while slot < ext_slots and added < num_new_bm:
+                struct.pack_into(">I", eb, slot * 4, bm_blknums[src_idx])
+                slot += 1; added += 1; src_idx += 1
+            next_ep = new_ext_relblks[ei + 1] if ei + 1 < len(new_ext_relblks) else 0
+            struct.pack_into(">I", eb, (nlongs - 1) * 4, next_ep)
+            if not write_blk(ep, eb):
+                return False, (f"Failed to write new ext block {ep} "
+                               f"(abs {part_abs + ep * spb}).")
 
-    if added < num_new_bm and ext_chain:
-        last_ext_blk, last_ext_used = ext_chain[-1]
-        eb = read_blk(part_abs + last_ext_blk)
-        if not eb:
-            return False, f"Cannot re-read last ext block {last_ext_blk}."
-        slot = last_ext_used
-        while slot < _FFS_EXT_BM_MAX and added < num_new_bm:
-            struct.pack_into(">I", eb, slot * 4, bm_blknums[src_idx])
-            slot += 1; added += 1; src_idx += 1
-        struct.pack_into(">I", eb, (nlongs - 1) * 4,
-                         new_ext_relblks[0] if new_ext_relblks else 0)
-        if not write_blk(part_abs + last_ext_blk, eb):
-            return False, f"Failed to write updated ext block {last_ext_blk}."
+        if new_ext_relblks and not ext_chain:
+            struct.pack_into(">I", root_buf, RL_BM_EXT * 4, new_ext_relblks[0])
+        elif not new_ext_relblks and not ext_chain:
+            struct.pack_into(">I", root_buf, RL_BM_EXT * 4, 0)
 
-    for ei, ep in enumerate(new_ext_relblks):
-        eb   = bytearray(eff_bsz)
-        slot = 0
-        while slot < _FFS_EXT_BM_MAX and added < num_new_bm:
-            struct.pack_into(">I", eb, slot * 4, bm_blknums[src_idx])
-            slot += 1; added += 1; src_idx += 1
-        next_ep = new_ext_relblks[ei + 1] if ei + 1 < len(new_ext_relblks) else 0
-        struct.pack_into(">I", eb, (nlongs - 1) * 4, next_ep)
-        if not write_blk(part_abs + ep, eb):
-            return False, f"Failed to write new ext block {ep} (abs {part_abs + ep})."
+        # Phase 8: relocate root block to (reserved + new_blocks - 1) / 2
+        prog("Relocating root block...")
+        new_root  = (reserved + new_blocks - 1) // 2
+        if new_root < reserved:
+            return False, f"new_root {new_root} < reserved {reserved} — impossible geometry."
 
-    if new_ext_relblks and not ext_chain:
-        struct.pack_into(">I", root_buf, _FFS_RL_BM_EXT * 4, new_ext_relblks[0])
-    elif not new_ext_relblks and not ext_chain:
-        struct.pack_into(">I", root_buf, _FFS_RL_BM_EXT * 4, 0)
+        bm_idx_nr = (new_root  - reserved) // bpbm
+        bm_idx_or = ((root_blk - reserved) // bpbm) if root_blk >= reserved else 0
 
-    # Phase 8: relocate root block to (reserved + new_blocks - 1) / 2
-    prog("Relocating root block...")
-    new_root  = (reserved + new_blocks - 1) // 2
-    if new_root < reserved:
-        return False, f"new_root {new_root} < reserved {reserved} — impossible geometry."
+        if bm_idx_nr >= len(bm_blknums):
+            return False, (f"new_root bm index {bm_idx_nr} out of range "
+                           f"(bm_count={len(bm_blknums)}).")
 
-    bm_idx_nr = (new_root  - reserved) // bpbm
-    bm_idx_or = ((root_blk - reserved) // bpbm) if root_blk >= reserved else 0
+        nr_bm_buf = read_blk(bm_blknums[bm_idx_nr])
+        if not nr_bm_buf:
+            return False, "Cannot read bm block for root relocation."
+        off_nr = (new_root - reserved) % bpbm
+        _bm_setused(nr_bm_buf, off_nr)
+        if new_root != root_blk and bm_idx_or == bm_idx_nr and root_blk >= reserved:
+            _bm_setfree(nr_bm_buf, (root_blk - reserved) % bpbm)
+        struct.pack_into(">I", nr_bm_buf, 0, 0)
+        struct.pack_into(">I", nr_bm_buf, 0, _ffs_checksum(bytes(nr_bm_buf), nlongs))
+        if not write_blk(bm_blknums[bm_idx_nr], nr_bm_buf):
+            return False, "Failed to write bm block for root relocation."
 
-    if bm_idx_nr >= len(bm_blknums):
-        return False, (f"new_root bm index {bm_idx_nr} out of range "
-                       f"(bm_count={len(bm_blknums)}).")
+        if new_root != root_blk and bm_idx_or != bm_idx_nr and root_blk >= reserved:
+            if bm_idx_or < len(bm_blknums):
+                or_bm_buf = read_blk(bm_blknums[bm_idx_or])
+                if or_bm_buf:
+                    _bm_setfree(or_bm_buf, (root_blk - reserved) % bpbm)
+                    struct.pack_into(">I", or_bm_buf, 0, 0)
+                    struct.pack_into(">I", or_bm_buf, 0, _ffs_checksum(bytes(or_bm_buf), nlongs))
+                    write_blk(bm_blknums[bm_idx_or], or_bm_buf)
 
-    nr_bm_buf = read_blk(part_abs + bm_blknums[bm_idx_nr])
-    if not nr_bm_buf:
-        return False, "Cannot read bm block for root relocation."
-    off_nr = (new_root - reserved) % bpbm
-    _bm_setused(nr_bm_buf, off_nr)
-    if new_root != root_blk and bm_idx_or == bm_idx_nr and root_blk >= reserved:
-        _bm_setfree(nr_bm_buf, (root_blk - reserved) % bpbm)
-    struct.pack_into(">I", nr_bm_buf, 0, 0)
-    struct.pack_into(">I", nr_bm_buf, 0, _ffs_checksum(bytes(nr_bm_buf), nlongs))
-    if not write_blk(part_abs + bm_blknums[bm_idx_nr], nr_bm_buf):
-        return False, "Failed to write bm block for root relocation."
+        # Write root at new position; clear fields FFS validates.
+        # HT_SIZE = nlongs - 56 (72 for 512-byte FS, 200 for 1024-byte, 968 for 4096).
+        # RL_PARENT = nlongs - 3 (byte offset 500 for 512-byte FS, 1012 for 1024-byte).
+        # bm_flag = VALID: we run on Linux with no live FFS, so cache coherency
+        # isn't a concern (cf. DiskPart, which sets 0 because it runs on AmigaOS
+        # alongside FFS).  Our bm chain + bit state is what we just wrote — FFS
+        # can trust it, and the user sees correct free space without waiting for
+        # (or being misreported by) the AmigaOS DiskValidator.
+        struct.pack_into(">I", root_buf,   4,   0)              # rb_OwnKey   = 0
+        struct.pack_into(">I", root_buf,   8,   0)              # rb_SeqNum   = 0
+        struct.pack_into(">I", root_buf,  12,  HT_SIZE)         # rb_HTSize
+        struct.pack_into(">I", root_buf,  16,   0)              # rb_Nothing1 = 0
+        struct.pack_into(">I", root_buf, RL_PARENT  * 4, 0)     # rb_Parent   = 0
+        struct.pack_into(">I", root_buf, RL_BM_FLAG * 4, _FFS_BM_VALID)
+        struct.pack_into(">I", root_buf, _FFS_RL_CHKSUM * 4, 0)
+        struct.pack_into(">I", root_buf, _FFS_RL_CHKSUM * 4, _ffs_checksum(bytes(root_buf), nlongs))
+        if not write_blk(new_root, root_buf):
+            return False, (f"Failed to write root at new position {new_root} "
+                           f"(abs {part_abs + new_root * spb}).")
 
-    if new_root != root_blk and bm_idx_or != bm_idx_nr and root_blk >= reserved:
-        if bm_idx_or < len(bm_blknums):
-            or_bm_buf = read_blk(part_abs + bm_blknums[bm_idx_or])
-            if or_bm_buf:
-                _bm_setfree(or_bm_buf, (root_blk - reserved) % bpbm)
-                struct.pack_into(">I", or_bm_buf, 0, 0)
-                struct.pack_into(">I", or_bm_buf, 0, _ffs_checksum(bytes(or_bm_buf), nlongs))
-                write_blk(part_abs + bm_blknums[bm_idx_or], or_bm_buf)
+        # Phase 9b: update fhb_Parent in root's direct children (hash table entries).
+        # Walk HT_SIZE entries (72 for 512-byte FS, 200 for 1024-byte, 968 for 4096).
+        prog("Updating file/directory parent pointers...")
+        FHB_PARENT    = nlongs - 3   # vfhb_Parent
+        FHB_HASHCHAIN = nlongs - 4   # vfhb_HashChain
+        if new_root != root_blk:
+            for ht_i in range(HT_SIZE):
+                blkno = struct.unpack_from(">I", root_buf, (6 + ht_i) * 4)[0]
+                depth = 0
+                while blkno and depth < 512:
+                    depth += 1
+                    fhb = read_blk(blkno)
+                    if not fhb:
+                        break
+                    if (struct.unpack_from(">I", fhb, 0)[0] != _FFS_T_SHORT or
+                            struct.unpack_from(">I", fhb, 4)[0] != blkno):
+                        break
+                    next_blkno = struct.unpack_from(">I", fhb, FHB_HASHCHAIN * 4)[0]
+                    struct.pack_into(">I", fhb, FHB_PARENT   * 4, new_root)
+                    struct.pack_into(">I", fhb, _FFS_RL_CHKSUM * 4, 0)
+                    struct.pack_into(">I", fhb, _FFS_RL_CHKSUM * 4, _ffs_checksum(bytes(fhb), nlongs))
+                    write_blk(blkno, fhb)
+                    blkno = next_blkno
 
-    # Write root at new position; clear fields FFS validates; bm_flag=0 → FFS rebuilds
-    struct.pack_into(">I", root_buf,   4,   0)    # rb_OwnKey  = 0
-    struct.pack_into(">I", root_buf,   8,   0)    # rb_SeqNum  = 0
-    struct.pack_into(">I", root_buf,  12,  72)    # rb_HTSize  = 72
-    struct.pack_into(">I", root_buf,  16,   0)    # rb_Nothing1 = 0
-    struct.pack_into(">I", root_buf, 500,   0)    # rb_Parent  = 0  (L[125])
-    struct.pack_into(">I", root_buf, _FFS_RL_BM_FLAG * 4, 0)
-    struct.pack_into(">I", root_buf, _FFS_RL_CHKSUM  * 4, 0)
-    struct.pack_into(">I", root_buf, _FFS_RL_CHKSUM  * 4, _ffs_checksum(bytes(root_buf), nlongs))
-    if not write_blk(part_abs + new_root, root_buf):
-        return False, f"Failed to write root at new position {new_root} (abs {part_abs + new_root})."
+        # Phase 9: update boot block bb[2] to new_root
+        prog("Updating boot block...")
+        struct.pack_into(">I", boot_buf, 8, new_root)   # L[2]
+        struct.pack_into(">I", boot_buf, 4, 0)           # L[1] = checksum field
+        bbsum = 0
+        for i in range(nlongs):
+            prev  = bbsum
+            bbsum = (bbsum + struct.unpack_from(">I", boot_buf, i * 4)[0]) & 0xFFFFFFFF
+            if bbsum < prev:
+                bbsum = (bbsum + 1) & 0xFFFFFFFF
+        struct.pack_into(">I", boot_buf, 4, (~bbsum) & 0xFFFFFFFF)
+        if not write_blk(0, boot_buf):
+            return False, "Failed to update boot block."
 
-    # Phase 9b: update fhb_Parent in root's direct children (hash table entries)
-    prog("Updating file/directory parent pointers...")
-    FHB_PARENT    = nlongs - 3   # L[125] = vfhb_Parent
-    FHB_HASHCHAIN = nlongs - 4   # L[124] = vfhb_HashChain
-    if new_root != root_blk:
-        for ht_i in range(72):
-            blkno = struct.unpack_from(">I", root_buf, (6 + ht_i) * 4)[0]
-            depth = 0
-            while blkno and depth < 512:
-                depth += 1
-                fhb = read_blk(part_abs + blkno)
-                if not fhb:
-                    break
-                if (struct.unpack_from(">I", fhb, 0)[0] != _FFS_T_SHORT or
-                        struct.unpack_from(">I", fhb, 4)[0] != blkno):
-                    break
-                next_blkno = struct.unpack_from(">I", fhb, FHB_HASHCHAIN * 4)[0]
-                struct.pack_into(">I", fhb, FHB_PARENT   * 4, new_root)
-                struct.pack_into(">I", fhb, _FFS_RL_CHKSUM * 4, 0)
-                struct.pack_into(">I", fhb, _FFS_RL_CHKSUM * 4, _ffs_checksum(bytes(fhb), nlongs))
-                write_blk(part_abs + blkno, fhb)
-                blkno = next_blkno
+        # Phase 9c: stamp bm_flag=VALID on old root so FFS doesn't run its validator
+        if new_root != root_blk:
+            old_root_buf = read_blk(root_blk)
+            if (old_root_buf and
+                    struct.unpack_from(">I", old_root_buf, 0)[0] == _FFS_T_SHORT and
+                    struct.unpack_from(">I", old_root_buf, RL_SEC_TYPE * 4)[0] == _FFS_ST_ROOT and
+                    struct.unpack_from(">I", old_root_buf, RL_BM_FLAG * 4)[0] != _FFS_BM_VALID):
+                struct.pack_into(">I", old_root_buf, RL_BM_FLAG * 4, _FFS_BM_VALID)
+                struct.pack_into(">I", old_root_buf, _FFS_RL_CHKSUM * 4, 0)
+                struct.pack_into(">I", old_root_buf, _FFS_RL_CHKSUM * 4,
+                                 _ffs_checksum(bytes(old_root_buf), nlongs))
+                write_blk(root_blk, old_root_buf)   # non-fatal if fails
 
-    # Phase 9: update boot block bb[2] to new_root
-    prog("Updating boot block...")
-    struct.pack_into(">I", boot_buf, 8, new_root)   # L[2]
-    struct.pack_into(">I", boot_buf, 4, 0)           # L[1] = checksum field
-    bbsum = 0
-    for i in range(nlongs):
-        prev  = bbsum
-        bbsum = (bbsum + struct.unpack_from(">I", boot_buf, i * 4)[0]) & 0xFFFFFFFF
-        if bbsum < prev:
-            bbsum = (bbsum + 1) & 0xFFFFFFFF
-    struct.pack_into(">I", boot_buf, 4, (~bbsum) & 0xFFFFFFFF)
-    if not write_blk(part_abs, boot_buf):
-        return False, "Failed to update boot block."
+        msg = (f"FFS filesystem grown.\n"
+               f"old_hi={old_hi}  new_hi={pi.high_cyl}\n"
+               f"old_blocks={old_blocks}  new_blocks={new_blocks}  spb={spb}\n"
+               f"new_bm_need={new_bm_need}  num_new_bm={num_new_bm}\n"
+               f"Root: rel {root_blk} → rel {new_root}")
+        return True, msg
+    finally:
+        # Force everything to disk once.  Previous per-write fsync was the
+        # main reason a multi-GB grow looked hung — we trade per-block
+        # durability for one fsync at completion.
+        try:
+            _f.flush()
+            os.fsync(_f.fileno())
+        except OSError:
+            pass
+        _f.close()
 
-    # Phase 9c: stamp bm_flag=VALID on old root so FFS doesn't run its validator
-    if new_root != root_blk:
-        old_root_buf = read_blk(part_abs + root_blk)
-        if (old_root_buf and
-                struct.unpack_from(">I", old_root_buf, 0)[0] == _FFS_T_SHORT and
-                struct.unpack_from(">I", old_root_buf, (nlongs - 1) * 4)[0] == _FFS_ST_ROOT and
-                struct.unpack_from(">I", old_root_buf, _FFS_RL_BM_FLAG * 4)[0] != _FFS_BM_VALID):
-            struct.pack_into(">I", old_root_buf, _FFS_RL_BM_FLAG * 4, _FFS_BM_VALID)
-            struct.pack_into(">I", old_root_buf, _FFS_RL_CHKSUM  * 4, 0)
-            struct.pack_into(">I", old_root_buf, _FFS_RL_CHKSUM  * 4,
-                             _ffs_checksum(bytes(old_root_buf), nlongs))
-            write_blk(part_abs + root_blk, old_root_buf)   # non-fatal if fails
-
-    msg = (f"FFS filesystem grown.\n"
-           f"old_hi={old_hi}  new_hi={pi.high_cyl}\n"
-           f"old_blocks={old_blocks}  new_blocks={new_blocks}\n"
-           f"new_bm_need={new_bm_need}  num_new_bm={num_new_bm}\n"
-           f"Root: rel {root_blk} → rel {new_root}")
-    return True, msg
 
 # ── PFS filesystem grow ─────────────────────────────────────────────────────────
 
@@ -1032,7 +1133,7 @@ def read_rdb(dev: str) -> Optional[RDBInfo]:
         # e+76: BootBlocks
         p.size_block   = struct.unpack_from(">I", data, e+ 4)[0]
         p.surfaces     = struct.unpack_from(">I", data, e+12)[0]
-        p.secs_per_blk = struct.unpack_from(">I", data, e+16)[0]
+        p.secs_per_blk = struct.unpack_from(">I", data, e+16)[0] or 1
         p.blk_per_trk  = struct.unpack_from(">I", data, e+20)[0]
         p.reserved     = struct.unpack_from(">I", data, e+24)[0]
         p.prealloc     = struct.unpack_from(">I", data, e+28)[0]
@@ -1164,7 +1265,7 @@ def build_part_block(p: PartitionInfo, rdb_heads: int, rdb_sectors: int) -> byte
     struct.pack_into(">I", d, e+ 4, p.size_block)  # SizeBlock
     struct.pack_into(">I", d, e+ 8, 0)             # SecOrg
     struct.pack_into(">I", d, e+12, surfs)         # Surfaces
-    struct.pack_into(">I", d, e+16, 1)             # SectorsPerBlock
+    struct.pack_into(">I", d, e+16, p.secs_per_blk if p.secs_per_blk > 0 else 1)  # SectorsPerBlock
     struct.pack_into(">I", d, e+20, spt)           # BlocksPerTrack
     struct.pack_into(">I", d, e+24, p.reserved)    # Reserved
     struct.pack_into(">I", d, e+28, p.prealloc)    # PreAlloc
@@ -1632,10 +1733,12 @@ class AddPartitionDialog(tk.Toplevel):
         # ── Advanced ──────────────────────────────────────────────────────────
         self._adv_frame = ttk.LabelFrame(f, text="Advanced")
         self._adv_frame.grid(row=row, columnspan=2, sticky="ew", pady=(4, 2)); row += 1
+        # Secs/block is derived from the "Block size" dropdown on save
+        # (size_block stays at 128 = 512-byte device sector; multiplier folds
+        # into secs_per_blk), so no separate field is shown here.
         fill_frame(self._adv_frame, [
             ("Surfaces:",   str(self._rdb.heads),   "surfaces",   8),
             ("Secs/track:", str(self._rdb.sectors), "blkpertrk",  8),
-            ("Secs/block:", "1",                    "secsperblk", 8),
             ("Reserved:",   "2",                    "reserved",   8),
             ("PreAlloc:",   "0",                    "prealloc",   8),
             ("Interleave:", "0",                    "interleave", 8),
@@ -1697,7 +1800,6 @@ class AddPartitionDialog(tk.Toplevel):
             bp          = int(self._vars["bootpri"].get())
             surfaces    = _parse_intval(self._vars["surfaces"].get())
             blkpertrk   = _parse_intval(self._vars["blkpertrk"].get())
-            secsperblk  = _parse_intval(self._vars["secsperblk"].get())
             reserved    = _parse_intval(self._vars["reserved"].get())
             prealloc    = _parse_intval(self._vars["prealloc"].get())
             interleave  = _parse_intval(self._vars["interleave"].get())
@@ -1708,7 +1810,12 @@ class AddPartitionDialog(tk.Toplevel):
         except ValueError:
             messagebox.showerror("Error", "Numeric fields must be integers.", parent=self); return
         bufmemtype = next(v for lbl, v in BUFMEMTYPE_OPTS if lbl == self._bufmemtype_var.get())
-        size_block = next(v for lbl, v in SIZEBLOCK_OPTS if lbl == self._sizeblock_var.get())
+        # "Block size" dropdown is the FS block size in bytes.  Keep the device
+        # sector at 512 (size_block = 128) and fold the multiplier into
+        # secs_per_blk — this matches what the AmigaOS FFS expects.
+        fs_bsz     = next(v for lbl, v in SIZEBLOCK_OPTS if lbl == self._sizeblock_var.get())
+        size_block = 128
+        secsperblk = max(1, fs_bsz // 512)
         if lo < self._rdb.locyl or hi > self._rdb.hicyl or lo > hi:
             messagebox.showerror("Error",
                 f"Cylinder range must be within {self._rdb.locyl}–{self._rdb.hicyl}.", parent=self)
@@ -1885,10 +1992,12 @@ class EditPartitionDialog(tk.Toplevel):
         # ── Advanced ──────────────────────────────────────────────────────────
         self._adv_frame = ttk.LabelFrame(f, text="Advanced")
         self._adv_frame.grid(row=row, columnspan=2, sticky="ew", pady=(4, 2)); row += 1
+        # Secs/block is derived from the "Block size" dropdown on save
+        # (size_block stays at 128 = 512-byte device sector; multiplier folds
+        # into secs_per_blk), so no separate field is shown here.
         fill_frame(self._adv_frame, [
             ("Surfaces:",   str(p.surfaces),     "surfaces",   8),
             ("Secs/track:", str(p.blk_per_trk),  "blkpertrk",  8),
-            ("Secs/block:", str(p.secs_per_blk), "secsperblk", 8),
             ("Reserved:",   str(p.reserved),     "reserved",   8),
             ("PreAlloc:",   str(p.prealloc),     "prealloc",   8),
             ("Interleave:", str(p.interleave),   "interleave", 8),
@@ -1918,8 +2027,10 @@ class EditPartitionDialog(tk.Toplevel):
         # Block Size dropdown (row 2, col 0)
         tk.Label(prm, text="Block size:", justify="right").grid(
             row=2, column=0, sticky="e", padx=(8, 2), pady=2)
-        _sb_default = next((lbl for lbl, v in SIZEBLOCK_OPTS if v == p.size_block),
-                           f"Custom ({p.size_block})")
+        # Dropdown is in FS bytes = size_block*4 * secs_per_blk
+        _fs_bsz_now = (p.size_block * 4) * (p.secs_per_blk if p.secs_per_blk > 0 else 1)
+        _sb_default = next((lbl for lbl, v in SIZEBLOCK_OPTS if v == _fs_bsz_now),
+                           f"Custom ({_fs_bsz_now} B)")
         self._sizeblock_var = tk.StringVar(value=_sb_default)
         _sb_values = [lbl for lbl, _ in SIZEBLOCK_OPTS]
         if _sb_default not in _sb_values:
@@ -2001,7 +2112,6 @@ class EditPartitionDialog(tk.Toplevel):
             bp          = int(self._vars["bootpri"].get())
             surfaces    = _parse_intval(self._vars["surfaces"].get())
             blkpertrk   = _parse_intval(self._vars["blkpertrk"].get())
-            secsperblk  = _parse_intval(self._vars["secsperblk"].get())
             reserved    = _parse_intval(self._vars["reserved"].get())
             prealloc    = _parse_intval(self._vars["prealloc"].get())
             interleave  = _parse_intval(self._vars["interleave"].get())
@@ -2014,10 +2124,19 @@ class EditPartitionDialog(tk.Toplevel):
         sel = self._bufmemtype_var.get()
         bufmemtype = next((v for lbl, v in BUFMEMTYPE_OPTS if lbl == sel),
                           int(sel.split("(")[1].rstrip(")")))
+        # "Block size" dropdown is the FS block size in bytes.  Keep the device
+        # sector at 512 (size_block = 128) and fold the multiplier into
+        # secs_per_blk — matches the convention AmigaOS FFS expects.
         sel_sb = self._sizeblock_var.get()
-        size_block = next((v for lbl, v in SIZEBLOCK_OPTS if lbl == sel_sb), None)
-        if size_block is None:
-            size_block = int(sel_sb.split("(")[1].rstrip(")"))
+        fs_bsz = next((v for lbl, v in SIZEBLOCK_OPTS if lbl == sel_sb), None)
+        if fs_bsz is None:
+            # "Custom (NNN B)" fallback from the default-formatter above
+            try:
+                fs_bsz = int(sel_sb.split("(")[1].rstrip(" B)"))
+            except (IndexError, ValueError):
+                fs_bsz = 512
+        size_block = 128
+        secsperblk = max(1, fs_bsz // 512)
 
         if lo < self._min_lo or hi > self._max_hi or lo > hi:
             messagebox.showerror("Error",
@@ -2228,6 +2347,74 @@ class AddFilesystemDialog(tk.Toplevel):
         fs.data       = data
         self.result   = fs
         self.destroy()
+
+
+# ─── FFS/PFS grow progress dialog ──────────────────────────────────────────────
+
+class _GrowProgressDialog(tk.Toplevel):
+    """Modal progress dialog that runs an FS-grow function in a worker thread.
+
+    Without this the GUI calls _ffs_grow / _pfs_grow synchronously on the Tk
+    main thread, which blocks the event loop and looks hung on multi-GB
+    partitions.  The worker thread sends phase strings through a queue; the
+    dialog polls it and updates the label."""
+
+    def __init__(self, parent, title: str, grow_fn, *grow_args):
+        super().__init__(parent)
+        self.title(title)
+        self.resizable(False, False)
+        self.protocol("WM_DELETE_WINDOW", lambda: None)   # disable close
+        self.transient(parent)
+        self.result_ok  = False
+        self.result_msg = ""
+
+        f = tk.Frame(self, padx=20, pady=14)
+        f.pack(fill="both", expand=True)
+        self._lbl = tk.Label(f, text="Starting…", width=52, anchor="w")
+        self._lbl.pack(fill="x")
+        self._bar = ttk.Progressbar(f, length=440, mode="indeterminate")
+        self._bar.pack(fill="x", pady=(8, 0))
+        self._bar.start(60)
+        tk.Label(f, text="Do not power off or unplug the disk.",
+                 fg="#cc4400").pack(anchor="w", pady=(8, 0))
+
+        self._q = queue.Queue()
+        self.update_idletasks()
+        pw, ph = parent.winfo_width(),  parent.winfo_height()
+        px, py = parent.winfo_rootx(),  parent.winfo_rooty()
+        dw, dh = self.winfo_reqwidth(), self.winfo_reqheight()
+        self.geometry(f"{dw}x{dh}+{px + (pw - dw)//2}+{py + (ph - dh)//2}")
+        self.grab_set()
+
+        def cb(msg):
+            self._q.put(("phase", msg))
+
+        def worker():
+            try:
+                ok, msg = grow_fn(*grow_args, progress_cb=cb)
+            except Exception as e:
+                ok, msg = False, f"Exception during grow: {e}"
+            self._q.put(("done", ok, msg))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(80, self._poll)
+        self.wait_window()
+
+    def _poll(self):
+        try:
+            while True:
+                item = self._q.get_nowait()
+                if item[0] == "phase":
+                    self._lbl.config(text=item[1])
+                elif item[0] == "done":
+                    self.result_ok  = item[1]
+                    self.result_msg = item[2]
+                    self._bar.stop()
+                    self.destroy()
+                    return
+        except queue.Empty:
+            pass
+        self.after(80, self._poll)
 
 
 # ─── dd progress dialog ────────────────────────────────────────────────────────
@@ -3356,7 +3543,9 @@ class App(tk.Tk):
                                 "This writes FFS bitmap blocks directly to disk.\n"
                                 "Always have a backup before proceeding.",
                                 parent=self, icon="warning"):
-                            ok, msg = _ffs_grow(dev, self._rdb, pi, orig_hi)
+                            dlg = _GrowProgressDialog(self, "Growing FFS Filesystem…",
+                                                      _ffs_grow, dev, self._rdb, pi, orig_hi)
+                            ok, msg = dlg.result_ok, dlg.result_msg
                             if ok:
                                 messagebox.showinfo("FFS Grown",
                                     f"FFS filesystem grown.\n\n{msg}\n\n"
@@ -3369,7 +3558,9 @@ class App(tk.Tk):
                                 "EXPERIMENTAL: Grow the PFS filesystem to match?\n\n"
                                 "This updates PFS rootblock metadata on disk.",
                                 parent=self, icon="warning"):
-                            ok, msg = _pfs_grow(dev, self._rdb, pi, orig_hi)
+                            dlg = _GrowProgressDialog(self, "Growing PFS Filesystem…",
+                                                      _pfs_grow, dev, self._rdb, pi, orig_hi)
+                            ok, msg = dlg.result_ok, dlg.result_msg
                             if ok:
                                 messagebox.showinfo("PFS Grown",
                                     f"PFS filesystem grown.\n\n{msg}\n\n"
@@ -4008,7 +4199,9 @@ class App(tk.Tk):
                     "This writes FFS bitmap blocks directly to disk.\n"
                     "Always have a backup before proceeding.",
                     parent=self, icon="warning"):
-                ok, msg = _ffs_grow(dev, self._rdb, pi, old_hi)
+                dlg = _GrowProgressDialog(self, "Growing FFS Filesystem…",
+                                          _ffs_grow, dev, self._rdb, pi, old_hi)
+                ok, msg = dlg.result_ok, dlg.result_msg
                 if ok:
                     messagebox.showinfo("FFS Grown",
                         f"FFS filesystem grown successfully.\n\n{msg}\n\n"
@@ -4023,7 +4216,9 @@ class App(tk.Tk):
                     "EXPERIMENTAL: Grow the PFS filesystem to match?\n\n"
                     "This updates PFS rootblock metadata on disk.",
                     parent=self, icon="warning"):
-                ok, msg = _pfs_grow(dev, self._rdb, pi, old_hi)
+                dlg = _GrowProgressDialog(self, "Growing PFS Filesystem…",
+                                          _pfs_grow, dev, self._rdb, pi, old_hi)
+                ok, msg = dlg.result_ok, dlg.result_msg
                 if ok:
                     messagebox.showinfo("PFS Grown",
                         f"PFS filesystem grown successfully.\n\n{msg}\n\n"
