@@ -196,6 +196,80 @@ def _write_block(dev: str, block: int, data: bytes) -> bool:
         return False
 
 
+def _planned_rdb_blocks(rdb: "RDBInfo") -> int:
+    """Return how many 512-byte blocks the current RDB metadata will occupy."""
+    total = 1 + len(rdb.partitions) + len(rdb.filesystems)
+    for fs in rdb.filesystems:
+        if fs.data:
+            total += math.ceil(len(fs.data) / LSEG_DATA)
+    return total
+
+
+def _validate_partition_settings(name: str, size_block: int, surfaces: int, blk_per_trk: int,
+                                 secs_per_blk: int, reserved: int, prealloc: int,
+                                 interleave: int, num_buffer: int, max_transfer: int,
+                                 mask: int, boot_blocks: int) -> Optional[str]:
+    if len(name.encode("ascii", "replace")) > 31:
+        return "Drive name must fit in 31 ASCII characters."
+    if size_block < 1:
+        return "Block size must be at least 1 longword."
+    if surfaces < 1 or blk_per_trk < 1 or secs_per_blk < 1:
+        return "Surfaces, sectors/track, and sectors/block must be at least 1."
+    if reserved < 0 or prealloc < 0 or interleave < 0 or num_buffer < 0 or boot_blocks < 0:
+        return "Reserved, prealloc, interleave, buffers, and boot blocks cannot be negative."
+    if max_transfer < 0 or max_transfer > 0xFFFFFFFF:
+        return "MaxTransfer must fit in an unsigned 32-bit value."
+    if mask < 0 or mask > 0xFFFFFFFF:
+        return "Mask must fit in an unsigned 32-bit value."
+    return None
+
+
+def _validate_rdb_layout(rdb: "RDBInfo", disk_size_bytes: int) -> Optional[str]:
+    if rdb.heads < 1 or rdb.sectors < 1 or rdb.cylinders < 1:
+        return "RDB geometry must use positive heads, sectors, and cylinders."
+    if rdb.locyl < 0 or rdb.hicyl < rdb.locyl:
+        return "RDB cylinder range is invalid."
+    if rdb.hicyl >= rdb.cylinders:
+        return "Highest usable cylinder exceeds the configured cylinder count."
+
+    disk_blocks = disk_size_bytes // 512
+    geometry_blocks = rdb.cylinders * rdb.heads * rdb.sectors
+    if geometry_blocks > disk_blocks:
+        return "RDB geometry exceeds the size of the selected disk."
+
+    reserved_blocks = rdb.locyl * rdb.heads * rdb.sectors
+    needed_blocks = _planned_rdb_blocks(rdb)
+    if needed_blocks > reserved_blocks:
+        return (
+            f"RDB metadata needs {needed_blocks} block(s), but only {reserved_blocks} block(s) "
+            f"are reserved before cylinder {rdb.locyl}. Increase the reserved area or remove "
+            f"RDB filesystems/partitions."
+        )
+
+    seen_names = set()
+    prev_hi = None
+    for p in sorted(rdb.partitions, key=lambda part: part.low_cyl):
+        err = _validate_partition_settings(
+            p.drive_name, p.size_block, p.surfaces, p.blk_per_trk, p.secs_per_blk,
+            p.reserved, p.prealloc, p.interleave, p.num_buffer, p.max_transfer,
+            p.mask, p.boot_blocks)
+        if err:
+            return f"Partition '{p.drive_name}': {err}"
+        if p.low_cyl < rdb.locyl or p.high_cyl > rdb.hicyl or p.low_cyl > p.high_cyl:
+            return (
+                f"Partition '{p.drive_name}' is outside the usable cylinder range "
+                f"{rdb.locyl}-{rdb.hicyl}."
+            )
+        if prev_hi is not None and p.low_cyl <= prev_hi:
+            return "Partition cylinder ranges overlap."
+        if p.drive_name in seen_names:
+            return f"Partition name '{p.drive_name}' is used more than once."
+        prev_hi = p.high_cyl
+        seen_names.add(p.drive_name)
+
+    return None
+
+
 # ─── Partition Move / Grow ─────────────────────────────────────────────────────
 
 _MOVE_CHUNK = 128   # sectors per read/write pass (64 KB)
@@ -1593,7 +1667,21 @@ class InitRDBDialog(tk.Toplevel):
         if heads < 1 or spt < 1 or cyls < 1 or rdbhi < 0:
             messagebox.showerror("Error", "Values must be positive.", parent=self); return
 
+        total_secs = self._disk["size"] // 512
+        if cyls * heads * spt > total_secs:
+            messagebox.showerror(
+                "Error",
+                "The selected geometry is larger than the disk/image size.",
+                parent=self)
+            return
+
         locyl = math.ceil((rdbhi + 1) / (heads * spt))
+        if locyl >= cyls:
+            messagebox.showerror(
+                "Error",
+                "The reserved RDB area leaves no cylinders available for partitions.",
+                parent=self)
+            return
 
         rdb = RDBInfo()
         rdb.block_num    = 0
@@ -1819,6 +1907,12 @@ class AddPartitionDialog(tk.Toplevel):
         if lo < self._rdb.locyl or hi > self._rdb.hicyl or lo > hi:
             messagebox.showerror("Error",
                 f"Cylinder range must be within {self._rdb.locyl}–{self._rdb.hicyl}.", parent=self)
+            return
+        err = _validate_partition_settings(
+            name, size_block, surfaces, blkpertrk, secsperblk, reserved, prealloc,
+            interleave, numbuffer, maxtransfer, mask, bootblocks)
+        if err:
+            messagebox.showerror("Error", err, parent=self)
             return
         for p in self._rdb.partitions:
             if lo <= p.high_cyl and hi >= p.low_cyl:
@@ -2142,6 +2236,12 @@ class EditPartitionDialog(tk.Toplevel):
             messagebox.showerror("Error",
                 f"Cylinder range must be within {self._min_lo}–{self._max_hi} "
                 f"and low ≤ high.", parent=self); return
+        err = _validate_partition_settings(
+            name, size_block, surfaces, blkpertrk, secsperblk, reserved, prealloc,
+            interleave, numbuffer, maxtransfer, mask, bootblocks)
+        if err:
+            messagebox.showerror("Error", err, parent=self)
+            return
 
         if lo < self._orig.low_cyl:
             messagebox.showerror("Cannot Resize From Start",
@@ -3723,59 +3823,67 @@ class App(tk.Tk):
         rdb.part_list_blk = part_blks[0] if part_blks else END_MARK
         rdb.fshdr_list    = fshd_blks[0] if fshd_blks else END_MARK
 
-        errors = []
+        err = _validate_rdb_layout(rdb, self._cur_disk["size"])
+        if err:
+            messagebox.showerror("Cannot Write RDB", err)
+            return
 
-        # Open once, write all RDB blocks, fsync once at the end.
+        writes = []
+        for i, (p, blk) in enumerate(zip(rdb.partitions, part_blks)):
+            p.block_num = blk
+            p.next_part = part_blks[i+1] if i+1 < n_parts else END_MARK
+            writes.append((blk, build_part_block(p, rdb.heads, rdb.sectors),
+                           f"PART block for {p.drive_name}"))
+
+        for i, (fs, fshd_blk, (first_lseg, n_lseg)) in enumerate(
+                zip(rdb.filesystems, fshd_blks, lseg_runs)):
+            next_fshd = fshd_blks[i+1] if i+1 < n_fs else END_MARK
+            first_lseg_or_end = first_lseg if n_lseg > 0 else END_MARK
+            writes.append((fshd_blk,
+                           build_fshd_block(fs, next_fshd, first_lseg_or_end),
+                           f"FSHD block for {fs.label}"))
+            for blk_num, blk_data in build_lseg_blocks(fs, first_lseg):
+                writes.append((blk_num, blk_data,
+                               f"LSEG block {blk_num} for {fs.label}"))
+
+        rdsk_data = build_rdsk_block(rdb)
+        # Keep upstream's single-open I/O, but stop on the first failure and
+        # flush metadata before publishing the new RDSK pointers. This is not
+        # atomic: existing metadata blocks may already have been overwritten.
+        desc = f"open {dev} for writing"
         try:
             with open(dev, "r+b") as fh:
-                def write_at(blk, data):
-                    try:
-                        fh.seek(blk * 512)
-                        fh.write(data)
-                        return True
-                    except OSError:
-                        return False
-
-                if not write_at(rdsk_blk, build_rdsk_block(rdb)):
-                    errors.append(f"Failed to write RDSK block at block {rdsk_blk}")
-
-                for i, (p, blk) in enumerate(zip(rdb.partitions, part_blks)):
-                    p.block_num = blk
-                    p.next_part = part_blks[i+1] if i+1 < n_parts else END_MARK
-                    if not write_at(blk, build_part_block(p, rdb.heads, rdb.sectors)):
-                        errors.append(f"Failed to write PART block for {p.drive_name}")
-
-                for i, (fs, fshd_blk, (first_lseg, n_lseg)) in enumerate(
-                        zip(rdb.filesystems, fshd_blks, lseg_runs)):
-                    next_fshd = fshd_blks[i+1] if i+1 < n_fs else END_MARK
-                    first_lseg_or_end = first_lseg if n_lseg > 0 else END_MARK
-                    if not write_at(fshd_blk,
-                                    build_fshd_block(fs, next_fshd, first_lseg_or_end)):
-                        errors.append(f"Failed to write FSHD block for {fs.label}")
-                    for blk_num, blk_data in build_lseg_blocks(fs, first_lseg):
-                        if not write_at(blk_num, blk_data):
-                            errors.append(f"Failed to write LSEG block {blk_num} for {fs.label}")
-
+                for blk_num, blk_data, desc in writes:
+                    fh.seek(blk_num * 512)
+                    if fh.write(blk_data) != len(blk_data):
+                        raise OSError("Short write")
+                desc = "flush RDB metadata"
                 fh.flush()
+                os.fsync(fh.fileno())
+                desc = f"RDSK block at block {rdsk_blk}"
+                fh.seek(rdsk_blk * 512)
+                if fh.write(rdsk_data) != len(rdsk_data):
+                    raise OSError("Short write")
+                fh.flush()
+                os.fsync(fh.fileno())
         except OSError as e:
-            errors.append(f"Cannot open {dev} for writing: {e}")
+            messagebox.showerror("Write Error", f"Failed to write {desc}: {e}",
+                                 parent=self)
+            return
 
-        if errors:
-            messagebox.showerror("Write Errors", "\n".join(errors), parent=self)
-        else:
-            part_info = ", ".join(str(b) for b in part_blks) or "none"
-            fs_info   = ", ".join(str(b) for b in fshd_blks) or "none"
-            messagebox.showinfo("Success",
-                f"Amiga RDB written to {dev}!\n\n"
-                f"  RDSK block: {rdsk_blk}\n"
-                f"  PART block(s): {part_info}\n"
-                f"  FSHD block(s): {fs_info}\n\n"
-                f"Reboot the Amiga, then format each partition from AmigaOS.",
-                parent=self)
-            self._info["rdb"].config(
-                text=f"RDB written to disk ({n_parts} partition(s))",
-                foreground="#007700")
-            self._status.set(f"RDB successfully written to {dev}.")
+        part_info = ", ".join(str(b) for b in part_blks) or "none"
+        fs_info   = ", ".join(str(b) for b in fshd_blks) or "none"
+        messagebox.showinfo("Success",
+            f"Amiga RDB written to {dev}!\n\n"
+            f"  RDSK block: {rdsk_blk}\n"
+            f"  PART block(s): {part_info}\n"
+            f"  FSHD block(s): {fs_info}\n\n"
+            f"Reboot the Amiga, then format each partition from AmigaOS.",
+            parent=self)
+        self._info["rdb"].config(
+            text=f"RDB written to disk ({n_parts} partition(s))",
+            foreground="#007700")
+        self._status.set(f"RDB successfully written to {dev}.")
 
     # ── Filesystem list ───────────────────────────────────────────────────────
     def _refresh_filesystems(self):
@@ -3943,6 +4051,13 @@ class App(tk.Tk):
                 "This does not appear to be a valid RDB backup.")
             return
         n_blocks = len(raw) // 512
+        disk_blocks = self._cur_disk["size"] // 512
+        if n_blocks > disk_blocks:
+            messagebox.showerror(
+                "Invalid File",
+                "The backup is larger than the selected disk/image.",
+            )
+            return
         if not messagebox.askyesno("Confirm Restore",
                 f"⚠  WARNING  ⚠\n\n"
                 f"This will restore {n_blocks} block(s) to:\n\n"
@@ -3954,10 +4069,16 @@ class App(tk.Tk):
             messagebox.showerror("Permission Denied",
                 f"Cannot write to {dev}.\n\nRun this program with sudo.")
             return
-        for i in range(n_blocks):
+
+        # Restore metadata first and write block 0 last. Existing metadata
+        # can still be overwritten if a later write fails.
+        for i in range(1, n_blocks):
             if not _write_block(dev, i, raw[i*512:(i+1)*512]):
                 messagebox.showerror("Write Error", f"Failed to write block {i} to {dev}.")
                 return
+        if not _write_block(dev, 0, raw[:512]):
+            messagebox.showerror("Write Error", f"Failed to write block 0 to {dev}.")
+            return
         messagebox.showinfo("Restore Complete",
             f"Restored {n_blocks} block(s) to {dev}.\n\n"
             f"Re-select the disk to reload the RDB.")
@@ -4134,6 +4255,12 @@ class App(tk.Tk):
             img_size = os.path.getsize(path)
         except OSError as e:
             messagebox.showerror("Error", str(e))
+            return
+        if img_size > self._cur_disk["size"]:
+            messagebox.showerror(
+                "Error",
+                "The selected image is larger than the target disk/image.",
+            )
             return
         if not messagebox.askyesno("Confirm Restore",
                 f"⚠  WARNING  ⚠\n\n"
